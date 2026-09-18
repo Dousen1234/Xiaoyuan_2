@@ -19,7 +19,7 @@ struct CanFrame {
 /**
  * @brief CAN 通信抽象接口。
  *
- * 上层关节模组控制逻辑只依赖此接口，具体的达妙 USB2CAN / SocketCAN
+ * 上层关节模组控制逻辑只依赖此接口，具体的 SocketCAN / 串口
  * 驱动通过继承并实现本接口完成，实现与协议解耦。
  */
 class CanInterface {
@@ -28,8 +28,9 @@ public:
 
     /**
      * @brief 打开并初始化 CAN 设备
-     * @param device 设备名（如 SocketCAN 的 "can0"，或达妙 SDK 的设备句柄标识）
-     * @param bitrate 波特率，单位 bit/s，本项目为 1000000 (1M)
+     * @param device 设备名（如 SocketCAN 的 "can0"）
+     * @param bitrate 波特率，单位 bit/s，本项目为 1000000 (1M)，
+     *                实际由 `ip link set canX type can bitrate 1000000` 配置
      * @return 成功返回 true，失败返回 false
      */
     virtual bool open(const char* device, int bitrate) = 0;

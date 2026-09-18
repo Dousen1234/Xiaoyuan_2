@@ -1,0 +1,17 @@
+# 鲲弘 KH-UCANFDX6-Mini CAN 通道自动配置规则
+#
+# 作用：kcan 驱动创建 can0~can5 网络接口时，自动配置 1Mbps 波特率并 up，
+#       免去每次开机/插拔后手动执行 sudo ip link 命令。
+#       波特率如需修改，编辑下方 RUN 命令中的 bitrate 数值。
+#
+# 安装（需在外部终端以 root 执行一次）：
+#   sudo cp deploy/99-kcan-autosetup.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   然后重新拔插鲲弘 USB 设备（或 sudo rmmod kcan && sudo modprobe kcan）
+#
+# 卸载：
+#   sudo rm /etc/udev/rules.d/99-kcan-autosetup.rules && sudo udevadm control --reload-rules
+#
+# 说明：只对 kcan 驱动创建的接口生效（DRIVERS=="kcan"），不影响 PEAK 等其他 CAN 设备。
+
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="kcan", KERNEL=="can*", RUN+="/usr/sbin/ip link set %k type can bitrate 1000000", RUN+="/usr/sbin/ip link set %k up"

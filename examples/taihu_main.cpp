@@ -10,8 +10,13 @@
  * 上述大周期重复 3 次。
  *
  * - 发送线程：只负责向总线发送目标位置；
- * - 接收线程：只负责读取两个电机的返回数据，放入队列；
+ * - 接收线程：只负责读取各电机的返回数据，放入队列；
  * - 记录线程：从队列取出数据，写入 motor_log.csv。
+ *
+ * 用法:
+ *   ./taihu_main                  默认两个电机 ID=1,2（减速比 101/81）
+ *   ./taihu_main 2                单电机模式（ID=2，减速比默认 81）
+ *   ./taihu_main 2:81 3:101       显式指定各电机 ID 与减速比
  */
 
 #include <atomic>
@@ -20,6 +25,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -29,17 +36,17 @@
 #include <vector>
 
 #include "taihu/config.h"
-#include "taihu/damiao_usb2can.h"
 #include "taihu/motor_logger.h"
+#include "taihu/socket_can.h"
 #include "taihu/taihu_tools.h"
 
 namespace {
 
-constexpr const char* kSerialDevice = "/dev/ttyACM0"; // 串口设备（每条总线独立配置）
+constexpr const char* kCanDevice = "can0"; // CAN 通道（鲲弘 KH-UCANFDX6-Mini，can0~can5）
 
-// —— 电机配置 ——
-const std::vector<uint32_t> kMotorIds = {1,2};            // 两个电机的 CAN ID
-const std::vector<double>   kMotorGearRatios = {101.0, 81.0}; // 对应减速比（不同型号）
+// —— 默认电机配置（可被命令行参数覆盖）——
+const std::vector<uint32_t> kDefaultMotorIds = {1, 2};             // 默认两个电机的 CAN ID
+const std::vector<double>   kDefaultGearRatios = {101.0, 81.0};    // 对应减速比（不同型号）
 
 // —— 位置环增益 ——
 constexpr int32_t kPositionKp = 2000;
@@ -60,36 +67,27 @@ constexpr size_t kMaxQueueSize = 1000;
 // 一个大周期的总时长
 constexpr double kCycleSec = kHoldZeroSec + kMoveSec + kHoldTargetSec + kReturnSec;
 
-// 两个电机的目标角度
-struct TargetAngles {
-    double m1_deg; // 电机 1 目标角度（度，逆时针为正）
-    double m2_deg; // 电机 2 目标角度（度）
-};
-
-/// 根据周期内相对时间 t_rel（0 ~ kCycleSec）计算两个电机的目标角度。
-TargetAngles computeTarget(double t_rel) {
-    TargetAngles t;
+/// 根据周期内相对时间 t_rel（0 ~ kCycleSec）计算各电机目标角度（度）。
+/// 电机 0 转 +kAngleDeg，电机 1 转 -kAngleDeg，更多电机按奇偶交替方向。
+std::vector<double> computeTarget(double t_rel, size_t n) {
+    double base = 0.0; // 当前幅度（度）
 
     if (t_rel < kHoldZeroSec) {
-        // 阶段 1：保持零点
-        t.m1_deg = 0.0;
-        t.m2_deg = 0.0;
+        base = 0.0;                                            // 阶段 1：保持零点
     } else if (t_rel < kHoldZeroSec + kMoveSec) {
-        // 阶段 2：同时正转（0 → ±90°，线性插值）
-        const double p = (t_rel - kHoldZeroSec) / kMoveSec;
-        t.m1_deg = kAngleDeg * p;
-        t.m2_deg = -kAngleDeg * p;
+        base = kAngleDeg * (t_rel - kHoldZeroSec) / kMoveSec;  // 阶段 2：线性转到目标
     } else if (t_rel < kHoldZeroSec + kMoveSec + kHoldTargetSec) {
-        // 阶段 3：保持目标（等待 1 秒）
-        t.m1_deg = kAngleDeg;
-        t.m2_deg = -kAngleDeg;
+        base = kAngleDeg;                                      // 阶段 3：保持目标
     } else {
-        // 阶段 4：回到零点（线性插值）
         const double p = (t_rel - kHoldZeroSec - kMoveSec - kHoldTargetSec) / kReturnSec;
-        t.m1_deg = kAngleDeg * (1.0 - p);
-        t.m2_deg = -kAngleDeg * (1.0 - p);
+        base = kAngleDeg * (1.0 - p);                          // 阶段 4：回到零点
     }
-    return t;
+
+    std::vector<double> angles(n);
+    for (size_t i = 0; i < n; ++i) {
+        angles[i] = (i % 2 == 0) ? base : -base; // 相邻电机反方向运动
+    }
+    return angles;
 }
 
 // 一个采样点：时间戳 + 各电机状态
@@ -100,21 +98,42 @@ struct Sample {
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     using namespace taihu;
 
+    // 0. 解析命令行：电机列表，格式 "ID[:减速比]"，空格分隔；默认 1:101 2:81
+    std::vector<uint32_t> motor_ids = kDefaultMotorIds;
+    std::vector<double>   gear_ratios = kDefaultGearRatios;
+    if (argc >= 2) {
+        motor_ids.clear();
+        gear_ratios.clear();
+        for (int i = 1; i < argc; ++i) {
+            char* colon = std::strchr(argv[i], ':');
+            uint32_t id = static_cast<uint32_t>(std::strtoul(argv[i], nullptr, 0));
+            double ratio = 81.0;
+            if (colon) ratio = std::strtod(colon + 1, nullptr);
+            if (id == 0 || id > 127) {
+                std::cerr << "[错误] 无效电机 ID: " << argv[i] << "（应为 1~127）" << std::endl;
+                return -1;
+            }
+            motor_ids.push_back(id);
+            gear_ratios.push_back(ratio);
+        }
+    }
+
     // 1. 打开 CAN 设备
-    DamiaoUsb2CanInterface can;
-    if (!can.open(kSerialDevice, 0)) {
-        std::cerr << "[错误] 打开 " << kSerialDevice << " 失败" << std::endl;
+    SocketCanInterface can;
+    if (!can.open(kCanDevice, 0)) {
+        std::cerr << "[错误] 打开 " << kCanDevice << " 失败，请确认已接上鲲弘 CANFD 模块且接口已 up（ip link set " << kCanDevice << " up）" << std::endl;
         return -1;
     }
 
-    // 2. 定义并初始化两个电机
-    std::vector<MotorConfig> configs = {
-        {"motor_a", kMotorIds[0], kMotorGearRatios[0], kPositionKp, kPositionKd},
-        {"motor_b", kMotorIds[1], kMotorGearRatios[1], kPositionKp, kPositionKd},
-    };
+    // 2. 定义并初始化各电机
+    std::vector<MotorConfig> configs;
+    for (size_t i = 0; i < motor_ids.size(); ++i) {
+        configs.push_back({"motor_" + std::to_string(i), motor_ids[i], gear_ratios[i],
+                           kPositionKp, kPositionKd});
+    }
     std::vector<std::unique_ptr<JointModule>> motors;
     for (const auto& cfg : configs) {
         auto m = initMotor(can, cfg);
@@ -126,10 +145,15 @@ int main() {
     // 3. 日志记录器
     MotorLogger logger("record/motor_log.csv");
     if (!logger.isOpen()) {
-        std::cerr << "[错误] 打开日志文件失败" << std::endl;
+        std::cerr << "[错误] 打开日志文件失败: record/motor_log.csv" << std::endl;
+        std::cerr << "        常见原因: 该文件由 root 创建(sudo 运行过)导致当前用户无写权限,"
+                  << std::endl
+                  << "        或 record/ 目录不存在。可执行: sudo chown $USER record/motor_log.csv"
+                  << std::endl
+                  << "        或删除旧文件: rm -f record/motor_log.csv" << std::endl;
         return -1;
     }
-    logger.writeHeader(kMotorIds);
+    logger.writeHeader(motor_ids);
 
     // 4. 线程同步原语
     std::atomic<bool> running{true};
@@ -142,8 +166,7 @@ int main() {
         const auto start = std::chrono::steady_clock::now();
 
         // 初始：回到零点
-        motors[0]->setTargetPosition(0.0);
-        motors[1]->setTargetPosition(0.0);
+        for (auto& m : motors) m->setTargetPosition(0.0);
         std::this_thread::sleep_for(std::chrono::seconds(static_cast<int>(kInitSec)));
         std::printf("[信息] 已回到零点，开始周期轨迹\n");
 
@@ -154,10 +177,11 @@ int main() {
             if (t_cycle >= kCycleSec * kNumCycles) break;  // 3 个周期结束
 
             const double t_rel = std::fmod(t_cycle, kCycleSec);
-            const TargetAngles tgt = computeTarget(t_rel);
+            const std::vector<double> angles = computeTarget(t_rel, motors.size());
 
-            motors[0]->setTargetPosition(tgt.m1_deg * kDegToRad);
-            motors[1]->setTargetPosition(tgt.m2_deg * kDegToRad);
+            for (size_t i = 0; i < motors.size(); ++i) {
+                motors[i]->setTargetPosition(angles[i] * kDegToRad);
+            }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(kLoopPeriodMs));
         }
@@ -165,16 +189,22 @@ int main() {
         queue_cv.notify_all();  // 唤醒阻塞在 wait 的记录线程，避免其无法退出
     });
 
-    // 6. 接收线程：读两个电机状态，组合成 Sample 放入队列（带节流与容量上限）
+    // 6. 接收线程：读各电机状态，组合成 Sample 放入队列（带节流与容量上限）
     std::thread recv_thread([&]() {
         uint64_t sample_index = 0;
         while (running.load()) {
-            MotorStatus m1, m2;
-            if (readMotorStatus(can, kMotorIds[0], kMotorGearRatios[0], m1) &&
-                readMotorStatus(can, kMotorIds[1], kMotorGearRatios[1], m2)) {
+            std::vector<MotorStatus> statuses(motor_ids.size());
+            bool all_ok = true;
+            for (size_t i = 0; i < motor_ids.size(); ++i) {
+                if (!readMotorStatus(can, motor_ids[i], gear_ratios[i], statuses[i])) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
                 Sample s;
                 s.timestamp_s = static_cast<double>(sample_index) * kLogSamplePeriodSec;
-                s.motors = {m1, m2};
+                s.motors = std::move(statuses);
 
                 {
                     std::lock_guard<std::mutex> lock(queue_mutex);

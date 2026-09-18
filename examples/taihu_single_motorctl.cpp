@@ -16,12 +16,12 @@
 #include <thread>
 
 #include "taihu/config.h"
-#include "taihu/damiao_usb2can.h"
 #include "taihu/joint_module.h"
+#include "taihu/socket_can.h"
 
 namespace {
 
-constexpr const char* kSerialDevice = "/dev/ttyACM0"; // 串口设备（每条总线独立配置）
+constexpr const char* kCanDevice = "can0"; // CAN 通道（鲲弘 KH-UCANFDX6-Mini，can0~can5）
 
 // —— 位置环增益（需按实际负载调试） ——
 constexpr int32_t kPositionKp = 4000;
@@ -138,9 +138,9 @@ int main() {
     using namespace taihu;
 
     // 1. 打开 CAN 设备
-    DamiaoUsb2CanInterface can;
-    if (!can.open(kSerialDevice, 0)) {
-        std::printf("[错误] 打开串口 %s 失败\n", kSerialDevice);
+    SocketCanInterface can;
+    if (!can.open(kCanDevice, 0)) {
+        std::printf("[错误] 打开 %s 失败，请确认已接上鲲弘 CANFD 模块且接口已 up（ip link set %s up）\n", kCanDevice, kCanDevice);
         return -1;
     }
 

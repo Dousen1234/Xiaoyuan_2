@@ -8,9 +8,9 @@
  *
  * 单腿步态（5 个阶段，每阶段 kStepSec 秒，阶段间线性插值保证平滑）：
  *   阶段 0（回零停顿）：四个电机全部回到零位并停顿；
- *   阶段 1（膝盖摆动）：ID 1/4 保持不动，ID 2 转 +180°，ID 3 转 -180°；
+ *   阶段 1（膝盖摆动）：ID 1/4 保持不动，ID 2 转 -180°，ID 3 转 +180°；
  *   阶段 2（髋转整圈）：ID 1 转 +360°，ID 4 转 -360°，ID 2/3 保持不动；
- *   阶段 3（膝盖回零）：ID 1/4 保持不动，ID 2 转 -180° 回零，ID 3 转 +180° 回零；
+ *   阶段 3（膝盖回零）：ID 1/4 保持不动，ID 2 转 +180° 回零，ID 3 转 -180° 回零；
  *   阶段 4（回零停顿）：四个电机全部回到零位并停顿。
  *
  * - 发送线程：只负责按步态轨迹向总线发送目标位置；
@@ -33,13 +33,13 @@
 #include <vector>
 
 #include "taihu/config.h"
-#include "taihu/damiao_usb2can.h"
 #include "taihu/motor_logger.h"
+#include "taihu/socket_can.h"
 #include "taihu/taihu_tools.h"
 
 namespace {
 
-constexpr const char* kSerialDevice = "/dev/ttyACM0"; // 串口设备（每条总线独立配置）
+constexpr const char* kCanDevice = "can0"; // CAN 通道（鲲弘 KH-UCANFDX6-Mini，can0~can5）
 
 // —— 电机配置 ——
 const std::vector<uint32_t> kMotorIds        = {1, 2, 3, 4};            // 四个电机的 CAN ID
@@ -63,9 +63,9 @@ struct StepPose {
 // 5 个阶段的目标角度（相邻阶段之间做五次多项式插值，保证位置/速度/加速度连续）
 const std::vector<StepPose> kPhaseTargets = {
     {0.0,    0.0,    0.0,    0.0},    // 阶段 0：四电机回零，停顿
-    {0.0,    -180.0, 180.0,  0.0},    // 阶段 1：ID1/4 不动，ID2 +180°，ID3 -180°
+    {0.0,    -180.0, 180.0,  0.0},    // 阶段 1：ID1/4 不动，ID2 -180°，ID3 +180°
     {360.0,  -180.0, 180.0, -360.0},  // 阶段 2：ID1 +360°，ID4 -360°，ID2/3 不动
-    {360.0,    0.0,    0.0, -360.0},  // 阶段 3：ID1/4 不动，ID2 -180° 回零，ID3 +180° 回零
+    {360.0,    0.0,    0.0, -360.0},  // 阶段 3：ID1/4 不动，ID2 +180° 回零，ID3 -180° 回零
     {0.0,      0.0,    0.0,    0.0},  // 阶段 4：四电机回零，停顿
 };
 
@@ -116,9 +116,9 @@ int main() {
     using namespace taihu;
 
     // 1. 打开 CAN 设备
-    DamiaoUsb2CanInterface can;
-    if (!can.open(kSerialDevice, 0)) {
-        std::cerr << "[错误] 打开 " << kSerialDevice << " 失败" << std::endl;
+    SocketCanInterface can;
+    if (!can.open(kCanDevice, 0)) {
+        std::cerr << "[错误] 打开 " << kCanDevice << " 失败，请确认已接上鲲弘 CANFD 模块且接口已 up（ip link set " << kCanDevice << " up）" << std::endl;
         return -1;
     }
 
@@ -141,7 +141,12 @@ int main() {
     // 3. 日志记录器
     MotorLogger logger("record/motor_log.csv");
     if (!logger.isOpen()) {
-        std::cerr << "[错误] 打开日志文件失败" << std::endl;
+        std::cerr << "[错误] 打开日志文件失败: record/motor_log.csv" << std::endl;
+        std::cerr << "        常见原因: 该文件由 root 创建(sudo 运行过)导致当前用户无写权限,"
+                  << std::endl
+                  << "        或 record/ 目录不存在。可执行: sudo chown $USER record/motor_log.csv"
+                  << std::endl
+                  << "        或删除旧文件: rm -f record/motor_log.csv" << std::endl;
         return -1;
     }
     logger.writeHeader(kMotorIds);
