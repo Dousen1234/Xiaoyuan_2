@@ -27,7 +27,6 @@ function(taihu_add_executable name)
 endfunction()
 
 # —— 示例程序 ——
-taihu_add_executable(taihu_main         examples/taihu_main.cpp)
 taihu_add_executable(taihu_singleleg_step examples/taihu_singleleg_step.cpp)
 taihu_add_executable(taihu_single_motorctl examples/taihu_single_motorctl.cpp)
 taihu_add_executable(taihu_single_motorctl_xCAN examples/taihu_single_motorctl_xCAN.cpp)

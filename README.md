@@ -480,7 +480,6 @@ cmake --build build
 
 | 可执行文件 | 类型 | 说明 |
 |-----------|------|------|
-| `taihu_main` | 示例 | 双电机同步旋转（主 demo） |
 | `taihu_singleleg_step` | 示例 | 四电机单腿步态控制 |
 | `taihu_single_motorctl` | 示例 | 单电机交互式控制（位置/正弦） |
 | `taihu_single_motorctl_xCAN` | 示例 | 多 CAN 总线电机同步控制（每总线一线程，时序对齐） |
@@ -501,13 +500,13 @@ sudo ./build/kcanctl up can1 1000000     # 多总线时按需打开其它通道
 ./build/kcanctl list                     # 查看各通道状态（普通用户可用）
 ```
 
-### 2. 运行主 demo（双电机同步旋转）
+### 2. 运行 demo（单电机交互式控制）
 
 ```bash
-./build/taihu_main        # 通道已 up 后普通用户即可运行
+./build/taihu_single_motorctl   # 通道已 up 后普通用户即可运行
 ```
 
-电机 1（ID=1）逆时针转 90°、电机 2（ID=2）顺时针转 90°，同步运动。
+交互输入电机 CAN ID 与减速比后选择模式：1 位置控制（五次多项式轨迹）／2 正弦轨迹测试。多总线多电机同步控制请用 `./build/taihu_single_motorctl_xCAN`。
 
 ### 3. 标零（首次使用前）
 
@@ -539,7 +538,6 @@ TaiHu_motor_control/
 │   ├── motor_logger.cpp
 │   └── taihu_tools.cpp
 ├── examples/                    # 示例程序
-│   ├── taihu_main.cpp           #   主 demo（双电机同步旋转）
 │   ├── taihu_singleleg_step.cpp #   单腿步态（四电机，五次多项式轨迹）
 │   ├── taihu_single_motorctl.cpp #  单电机交互式控制（位置/正弦）
 │   └── taihu_single_motorctl_xCAN.cpp # 多总线电机同步控制（每总线一线程）
@@ -763,14 +761,6 @@ sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 ---
 
 ## 示例程序
-
-### `taihu_main`（主 demo，双电机同步旋转）
-
-```bash
-./build/taihu_main
-```
-
-双电机按分段周期轨迹同步运动：保持零点 → ±90° → 等待 → 回零，循环 3 次。配置见 [`examples/taihu_main.cpp`](examples/taihu_main.cpp:40) 顶部常量。
 
 ### `taihu_singleleg_step`（单腿步态，四电机）
 
