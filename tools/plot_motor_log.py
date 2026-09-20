@@ -44,15 +44,27 @@ FIELDS = [
 COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
 # —— 目标轨迹参数（复现自 examples/taihu_singleleg_step.cpp） ——
-STEP_SEC = 5.0                                  # 每个阶段时长 t (s)
-PHASE_TARGETS = [                               # 5 个阶段目标角度（度，ID1/2/3/4）
-    (0.0,    0.0,    0.0,    0.0),              # 阶段 0：回零停顿
-    (0.0,    180.0, -180.0,  0.0),              # 阶段 1：ID2 +180°，ID3 -180°
-    (360.0,  180.0, -180.0, -360.0),            # 阶段 2：ID1 +360°，ID4 -360°
-    (360.0,    0.0,    0.0, -360.0),            # 阶段 3：ID2/3 回零
-    (0.0,      0.0,    0.0,    0.0),            # 阶段 4：回零停顿
+STEP_SEC = 10.0                                 # 每个阶段时长 t (s)，须与 cpp 中 kStepSec 一致
+# 6 个阶段的关键帧序列（度，ID1/2/3/4）：单段阶段 2 个关键帧，往复阶段 4 个关键帧
+PHASE_KEYFRAMES = [
+    [(0.0, 0.0, 0.0, 0.0),                      # 阶段 0：回零保持
+     (0.0, 0.0, 0.0, 0.0)],
+    [(0.0,    0.0,   0.0,   0.0),               # 阶段 1：ID2 -180°，ID3 +360°
+     (0.0, -180.0, 360.0,   0.0)],
+    [(0.0, -180.0, 360.0, 0.0),                 # 阶段 2：ID1 往复 0→60→-60→0
+     (60.0, -180.0, 360.0, 0.0),
+     (-60.0, -180.0, 360.0, 0.0),
+     (0.0, -180.0, 360.0, 0.0)],
+    [(0.0, -180.0, 360.0, 0.0),                 # 阶段 3：ID2/3 反向回零
+     (0.0,    0.0,   0.0, 0.0)],
+    [(0.0, 0.0, 0.0,   0.0),                    # 阶段 4：ID4 往复 0→90→-90→0
+     (0.0, 0.0, 0.0,  90.0),
+     (0.0, 0.0, 0.0, -90.0),
+     (0.0, 0.0, 0.0,   0.0)],
+    [(0.0, 0.0, 0.0, 0.0),                      # 阶段 5：回零保持
+     (0.0, 0.0, 0.0, 0.0)],
 ]
-NUM_PHASES = len(PHASE_TARGETS)
+NUM_PHASES = len(PHASE_KEYFRAMES)
 TOTAL_SEC = STEP_SEC * NUM_PHASES
 DEG_TO_RAD = math.pi / 180.0
 
@@ -65,16 +77,18 @@ def quintic_smoothstep(t):
 def compute_target(t_rel):
     """复现 taihu_singleleg_step.cpp 的 computeTarget，返回 4 元组目标角度（度）。"""
     if t_rel < 0.0:
-        return PHASE_TARGETS[0]
+        return PHASE_KEYFRAMES[0][0]
     if t_rel >= TOTAL_SEC:
-        return PHASE_TARGETS[-1]
+        return PHASE_KEYFRAMES[-1][-1]
     phase = int(t_rel / STEP_SEC)
-    if phase >= NUM_PHASES - 1:  # 最后一个阶段（回零停顿）已到终点，无需插值
-        return PHASE_TARGETS[-1]
-    frac = (t_rel - phase * STEP_SEC) / STEP_SEC
+    kf = PHASE_KEYFRAMES[phase]
+    n_seg = len(kf) - 1
+    seg_sec = STEP_SEC / n_seg
+    t_phase = min(t_rel - phase * STEP_SEC, STEP_SEC - 1e-9)
+    seg = min(int(t_phase / seg_sec), n_seg - 1)
+    frac = (t_phase - seg * seg_sec) / seg_sec
     s = quintic_smoothstep(frac)
-    a = PHASE_TARGETS[phase]
-    b = PHASE_TARGETS[phase + 1]
+    a, b = kf[seg], kf[seg + 1]
     return tuple(a[i] + (b[i] - a[i]) * s for i in range(4))
 
 

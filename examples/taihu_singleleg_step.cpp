@@ -6,12 +6,16 @@
  *   - ID 1、ID 4：减速比 101
  *   - ID 2、ID 3：减速比 81
  *
- * 单腿步态（5 个阶段，每阶段 kStepSec 秒，阶段间线性插值保证平滑）：
- *   阶段 0（回零停顿）：四个电机全部回到零位并停顿；
- *   阶段 1（膝盖摆动）：ID 1/4 保持不动，ID 2 转 -180°，ID 3 转 +180°；
- *   阶段 2（髋转整圈）：ID 1 转 +360°，ID 4 转 -360°，ID 2/3 保持不动；
- *   阶段 3（膝盖回零）：ID 1/4 保持不动，ID 2 转 +180° 回零，ID 3 转 -180° 回零；
- *   阶段 4（回零停顿）：四个电机全部回到零位并停顿。
+ * 单腿步态（6 个阶段，每阶段 kStepSec 秒，相邻关键帧之间五次多项式插值保证平滑）：
+ *   阶段 0（回零停顿）：四个电机全部回到零位并保持不动；
+ *   阶段 1（膝盖摆动）：ID 1/4 保持不动，ID 2 转 -180°，ID 3 转 +360°；
+ *   阶段 2（ID1 往复摆）：ID 2/3/4 保持不动，ID 1 完成 0° → 60° → -60° → 0°；
+ *   阶段 3（膝盖回零）：ID 1/4 保持不动，ID 2/3 按与阶段 1 相反方向回到零位；
+ *   阶段 4（ID4 往复摆）：ID 1/2/3 保持不动，ID 4 完成 0° → 90° → -90° → 0°；
+ *   阶段 5（回零停顿）：四个电机全部回到零位并保持不动。
+ *
+ * 阶段 2/4 的往复运动在阶段内均分为 3 个子段（每子段 kStepSec/3 秒），
+ * 每个子段端点为一个关键帧，子段间同样做五次多项式插值。
  *
  * - 发送线程：只负责按步态轨迹向总线发送目标位置；
  * - 接收线程：只负责读取四个电机的返回数据，放入队列；
@@ -50,9 +54,9 @@ constexpr int32_t kPositionKp = 4000;
 constexpr int32_t kPositionKd = 60;
 
 // —— 步态轨迹参数 ——
-constexpr double kStepSec = 5.0; ///< 每个阶段时长 t (s)，按需修改
+constexpr double kStepSec = 10.0; ///< 每个阶段时长 t (s)，按需修改
 
-// 一个步态阶段里四个电机的目标角度（单位：度，逆时针为正，相对零位）
+// 一个关键帧里四个电机的目标角度（单位：度，逆时针为正，相对零位）
 struct StepPose {
     double id1_deg;
     double id2_deg;
@@ -60,16 +64,36 @@ struct StepPose {
     double id4_deg;
 };
 
-// 5 个阶段的目标角度（相邻阶段之间做五次多项式插值，保证位置/速度/加速度连续）
-const std::vector<StepPose> kPhaseTargets = {
-    {0.0,    0.0,    0.0,    0.0},    // 阶段 0：四电机回零，停顿
-    {0.0,    -180.0, 180.0,  0.0},    // 阶段 1：ID1/4 不动，ID2 -180°，ID3 +180°
-    {360.0,  -180.0, 180.0, -360.0},  // 阶段 2：ID1 +360°，ID4 -360°，ID2/3 不动
-    {360.0,    0.0,    0.0, -360.0},  // 阶段 3：ID1/4 不动，ID2 +180° 回零，ID3 -180° 回零
-    {0.0,      0.0,    0.0,    0.0},  // 阶段 4：四电机回零，停顿
+// 6 个阶段的关键帧序列：每个阶段由 1 或 3 个等长子段组成，
+// 子段端点即关键帧；相邻关键帧之间做五次多项式插值（位置/速度/加速度连续）。
+//   单段阶段：{起点, 终点}（2 个关键帧，1 个子段，子段时长 = kStepSec）
+//   往复阶段：{起点, 峰值, 谷值, 终点}（4 个关键帧，3 个子段，子段时长 = kStepSec/3）
+const std::vector<std::vector<StepPose>> kPhaseKeyframes = {
+    // 阶段 0：四电机回零，保持不动
+    {{0.0, 0.0, 0.0, 0.0},
+     {0.0, 0.0, 0.0, 0.0}},
+    // 阶段 1：ID1/4 不动，ID2 -180°，ID3 +360°
+    {{0.0,    0.0,   0.0,   0.0},
+     {0.0, -180.0, 360.0,   0.0}},
+    // 阶段 2：ID2/3/4 不动，ID1 往复 0° → 60° → -60° → 0°
+    {{0.0, -180.0, 360.0, 0.0},
+     {60.0, -180.0, 360.0, 0.0},
+     {-60.0, -180.0, 360.0, 0.0},
+     {0.0, -180.0, 360.0, 0.0}},
+    // 阶段 3：ID1/4 不动，ID2/3 按与阶段 1 相反方向回零
+    {{0.0, -180.0, 360.0, 0.0},
+     {0.0,    0.0,   0.0, 0.0}},
+    // 阶段 4：ID1/2/3 不动，ID4 往复 0° → 90° → -90° → 0°
+    {{0.0, 0.0, 0.0,   0.0},
+     {0.0, 0.0, 0.0,  90.0},
+     {0.0, 0.0, 0.0, -90.0},
+     {0.0, 0.0, 0.0,   0.0}},
+    // 阶段 5：四电机回零，保持不动
+    {{0.0, 0.0, 0.0, 0.0},
+     {0.0, 0.0, 0.0, 0.0}},
 };
 
-constexpr int    kNumPhases = 5;                    ///< 阶段数
+constexpr int    kNumPhases = 6;                     ///< 阶段数
 constexpr double kTotalSec  = kStepSec * kNumPhases; ///< 总运行时长 (s)
 
 // 接收队列容量上限（防止记录跟不上时无限增长）
@@ -77,24 +101,31 @@ constexpr size_t kMaxQueueSize = 1000;
 
 /// 五次多项式平滑函数（quintic smoothstep）。
 /// 满足 s(0)=0、s(1)=1，且一阶、二阶导数在两端均为 0，
-/// 用于相邻阶段之间的位置插值，保证位置、速度、加速度连续，轨迹更圆滑。
+/// 用于相邻关键帧之间的位置插值，保证位置、速度、加速度连续，轨迹更圆滑。
 double quinticSmoothstep(double t) {
     return 6.0 * t * t * t * t * t - 15.0 * t * t * t * t + 10.0 * t * t * t;
 }
 
 /// 根据相对时间 t_rel（0 ~ kTotalSec）计算四个电机的目标角度（度）。
+/// 先定位阶段，再在该阶段的关键帧序列中定位子段并做五次多项式插值。
 StepPose computeTarget(double t_rel) {
-    if (t_rel < 0.0) return kPhaseTargets.front();
-    if (t_rel >= kTotalSec) return kPhaseTargets.back();
+    if (t_rel < 0.0) return kPhaseKeyframes.front().front();
+    if (t_rel >= kTotalSec) return kPhaseKeyframes.back().back();
 
-    const int    phase = static_cast<int>(t_rel / kStepSec);          // 0 ~ kNumPhases-1
-    if (phase >= kNumPhases - 1) return kPhaseTargets.back();         // 最后阶段（回零停顿）已到终点
+    const int phase = static_cast<int>(t_rel / kStepSec);            // 0 ~ kNumPhases-1
+    const std::vector<StepPose>& kf = kPhaseKeyframes[phase];
+    const int    n_seg  = static_cast<int>(kf.size()) - 1;          // 该阶段子段数（1 或 3）
+    const double seg_sec = kStepSec / n_seg;                         // 子段时长
 
-    const double frac  = (t_rel - phase * kStepSec) / kStepSec;       // 0.0 ~ 1.0 归一化时间
-    const double s     = quinticSmoothstep(frac);                     // 五次多项式插值系数
+    double t_phase = t_rel - phase * kStepSec;                       // 阶段内时间
+    if (t_phase >= kStepSec) t_phase = kStepSec - 1e-9;              // 数值保护
+    int    seg  = static_cast<int>(t_phase / seg_sec);
+    if (seg >= n_seg) seg = n_seg - 1;
+    const double frac = (t_phase - seg * seg_sec) / seg_sec;         // 子段内归一化时间
+    const double s    = quinticSmoothstep(frac);
 
-    const StepPose& a = kPhaseTargets[phase];
-    const StepPose& b = kPhaseTargets[phase + 1];
+    const StepPose& a = kf[seg];
+    const StepPose& b = kf[seg + 1];
 
     StepPose p;
     p.id1_deg = a.id1_deg + (b.id1_deg - a.id1_deg) * s;
@@ -164,7 +195,7 @@ int main() {
         while (running.load()) {
             const double t = std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - start).count();
-            if (t >= kTotalSec) break;  // 5 个阶段结束
+            if (t >= kTotalSec) break;  // 6 个阶段结束
 
             const StepPose pose = computeTarget(t);
 

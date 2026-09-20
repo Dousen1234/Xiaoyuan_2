@@ -25,3 +25,4 @@ cmake_install.cmake
 Makefile
 *.o
 *.a
+__pycache__/
