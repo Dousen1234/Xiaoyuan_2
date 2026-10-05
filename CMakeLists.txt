@@ -28,6 +28,7 @@ endfunction()
 
 # —— 示例程序 ——
 taihu_add_executable(taihu_singleleg_step examples/taihu_singleleg_step.cpp)
+taihu_add_executable(taihu_singleleg_step_xCAN examples/taihu_singleleg_step_xCAN.cpp)
 taihu_add_executable(taihu_single_motorctl examples/taihu_single_motorctl.cpp)
 taihu_add_executable(taihu_single_motorctl_xCAN examples/taihu_single_motorctl_xCAN.cpp)
 

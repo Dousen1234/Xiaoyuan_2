@@ -481,6 +481,7 @@ cmake --build build
 | 可执行文件 | 类型 | 说明 |
 |-----------|------|------|
 | `taihu_singleleg_step` | 示例 | 四电机单腿步态控制 |
+| `taihu_singleleg_step_xCAN` | 示例 | 多 CAN 总线单腿步态同步控制（运行时输入步数 N 与总线数，每总线一条腿） |
 | `taihu_single_motorctl` | 示例 | 单电机交互式控制（位置/正弦） |
 | `taihu_single_motorctl_xCAN` | 示例 | 多 CAN 总线电机同步控制（每总线一线程，时序对齐） |
 | `taihu_motor_tools` | 工具 | **工具总入口（菜单式）**：数字键选总线 + 数字键选工具（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值） |
@@ -539,6 +540,7 @@ TaiHu_motor_control/
 │   └── taihu_tools.cpp
 ├── examples/                    # 示例程序
 │   ├── taihu_singleleg_step.cpp #   单腿步态（四电机，五次多项式轨迹）
+│   ├── taihu_singleleg_step_xCAN.cpp # 多总线单腿步态同步控制（每总线一条腿）
 │   ├── taihu_single_motorctl.cpp #  单电机交互式控制（位置/正弦）
 │   └── taihu_single_motorctl_xCAN.cpp # 多总线电机同步控制（每总线一线程）
 ├── tools/                       # 命令行工具入口 + 绘图脚本
@@ -781,6 +783,29 @@ sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 
 往复阶段在阶段内均分为 3 个子段（关键帧 0°/峰值/谷值/0°），相邻关键帧之间用**五次多项式**插值保证位置/速度/加速度连续、轨迹平滑。配置见 [`examples/taihu_singleleg_step.cpp`](examples/taihu_singleleg_step.cpp:44)。
 
+### `taihu_singleleg_step_xCAN`（多 CAN 总线单腿步态同步控制）
+
+```bash
+./build/taihu_singleleg_step_xCAN
+```
+
+在 `taihu_singleleg_step` 基础上扩展为**多总线 + 多步**版本：
+
+- **步态定义**：一步 = 3 个等长阶段（相邻关键帧之间五次多项式插值，一步首尾姿态重合，多步之间衔接连续）：
+
+| 阶段 | 动作 |
+|------|------|
+| 0 | 四电机在 0 位保持不动 |
+| 1 | ID1/4 不动，ID2/3 从 0° 转到 +180° |
+| 2 | ID1/4 不动，ID2/3 从 +180° 转回 0° |
+
+- **运行时交互输入**：步数 N（1~1000，默认 1）、CAN 总线数量（1~6）；每条总线输入接口名（可输入 `can0` 或通道号 `0`，自动补全为 `canN`，默认 can0、can1、…）；总时长 = 阶段时长 × 3 × N；
+- **阶段时长**：三个阶段时长完全相同，由源码开头的 [`kPhaseSec`](examples/taihu_singleleg_step_xCAN.cpp:57) 单一变量控制（默认 5.0 s），改一处即整体缩放步态快慢；
+- 每条总线挂**一条腿**（电机 ID 1~4，减速比 101/81/81/101），每条总线由独立线程组控制（发送/接收/记录各一个线程），所有总线先完成准备（清错、设增益、开日志），再由主线程设定**统一起跑时刻**（就绪后 +300ms），各线程自旋等待到该时刻后**同时开始步态**，保证跨总线时序对齐；
+- 日志按总线分文件：`record/motor_log_<接口名>.csv`（如 `record/motor_log_can0.csv`），绘图时作为输入传给 `tools/plot_motor_log.py`（文件名含 `_can` 会自动按本 demo 的步态模型画目标轨迹；走了多步时用 `--num-steps N` 指定，见[绘制曲线图](#绘制曲线图)）。
+
+典型场景：can0、can1 各接一条四电机腿，两腿严格同步连走 N 步。
+
 ### `taihu_single_motorctl`（单电机交互式控制）
 
 ```bash
@@ -810,7 +835,7 @@ sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 
 ## 日志与绘图
 
-运行示例时，会把各电机的状态（时间戳、位置、速度、电流、电压、错误）以 CSV 写入 [`record/motor_log.csv`](record/motor_log.csv:1)（覆盖模式，不入库）。
+运行示例时，会把各电机的状态（时间戳、位置、速度、电流、电压、错误）以 CSV 写入 [`record/motor_log.csv`](record/motor_log.csv:1)（覆盖模式，不入库）。多总线示例（`taihu_singleleg_step_xCAN`）按总线分文件：`record/motor_log_<接口名>.csv`。
 
 ### 采样周期
 
@@ -826,14 +851,29 @@ sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 ```bash
 python3 tools/plot_motor_log.py                    # 默认读 record/motor_log.csv，输出到 record/
 python3 tools/plot_motor_log.py record/motor_log.csv -o record
+python3 tools/plot_motor_log.py record/motor_log_can0.csv --num-steps 3   # xCAN 日志，运行时走了 3 步
 ```
 
 依赖 `python3 + matplotlib`。生成 4 张图（横轴均为时间，不同电机 ID 用不同颜色区分）：
 
-- `position.png`：位置曲线（叠加各电机同色虚线的**目标位置**做对照，目标轨迹复现自单腿步态）
+- `position.png`：位置曲线（叠加各电机同色虚线的**目标位置**做对照）
 - `velocity.png`：速度曲线
 - `current.png`：电流曲线（含四电机**瞬时电流之和**曲线）
 - `error.png`：错误状态曲线
+
+位置图的目标轨迹支持两种步态模型（[`tools/plot_motor_log.py`](tools/plot_motor_log.py:47)）：
+
+| 模型 | 复现自 | 轨迹 | 默认阶段时长 |
+|------|--------|------|------------|
+| `singleleg` | `examples/taihu_singleleg_step.cpp` | 6 阶段单腿步态（与 `kStepSec` 对应） | 10 s |
+| `xcan` | `examples/taihu_singleleg_step_xCAN.cpp` | 一步 3 阶段（零位保持 / ID2,3 0°→+180° / +180°→0°）重复 N 步（与 `kPhaseSec`、运行时 N 对应） | 5 s |
+
+相关命令行参数：
+
+- `--gait {auto,singleleg,xcan}`：步态模型，默认 `auto`（文件名含 `_can` → xcan，否则 singleleg）；
+- `--num-steps N`：xcan 步数 N，须与运行时输入一致（默认 1）；
+- `--phase-sec 秒`：每阶段时长，改了 cpp 的 `kStepSec`/`kPhaseSec` 后同步传入；
+- `--total-sec 秒`：直接指定总时长（优先于阶段时长×阶段数）。
 
 ---
 
