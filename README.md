@@ -484,6 +484,7 @@ cmake --build build
 | `taihu_singleleg_step_xCAN` | 示例 | 多 CAN 总线单腿步态同步控制（运行时输入步数 N 与总线数，每总线一条腿） |
 | `taihu_single_motorctl` | 示例 | 单电机交互式控制（位置/正弦） |
 | `taihu_single_motorctl_xCAN` | 示例 | 多 CAN 总线电机同步控制（每总线一线程，时序对齐） |
+| `taihu_keyboardctl` | 示例 | **键盘交互式控制单腿四电机**（↑↓ 按住转动松手即停，Ctrl+V/1~4/P 切换与查询） |
 | `taihu_motor_tools` | 工具 | **工具总入口（菜单式）**：数字键选总线 + 数字键选工具（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值） |
 | `kcanctl` | 工具 | 鲲弘 CAN 通道控制（打开/关闭通道、配置波特率，需 sudo） |
 
@@ -542,7 +543,8 @@ TaiHu_motor_control/
 │   ├── taihu_singleleg_step.cpp #   单腿步态（四电机，五次多项式轨迹）
 │   ├── taihu_singleleg_step_xCAN.cpp # 多总线单腿步态同步控制（每总线一条腿）
 │   ├── taihu_single_motorctl.cpp #  单电机交互式控制（位置/正弦）
-│   └── taihu_single_motorctl_xCAN.cpp # 多总线电机同步控制（每总线一线程）
+│   ├── taihu_single_motorctl_xCAN.cpp # 多总线电机同步控制（每总线一线程）
+│   └── taihu_keyboardctl.cpp    #   键盘交互式控制单腿四电机（按住转动松手即停）
 ├── tools/                       # 命令行工具入口 + 绘图脚本
 │   ├── taihu_motor_tools.cpp    #   工具总入口（菜单式，选总线+选工具）
 │   ├── kcanctl.c                #   鲲弘 CAN 通道控制（打开/关闭/波特率）
@@ -830,6 +832,41 @@ sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 - 控制模式与 `taihu_single_motorctl` 相同：1 位置控制（五次多项式轨迹，所有电机相同目标角度与时长）／2 正弦轨迹测试。
 
 典型场景：can0、can1 各接一台电机，两电机严格同步转动同一角度。
+
+### `taihu_keyboardctl`（键盘交互式控制单腿四电机）
+
+```bash
+./build/taihu_keyboardctl
+```
+
+用键盘实时控制**一条腿的四个电机**（ID 1~4，减速比 101/81/81/101）：
+
+- 启动后依次输入 CAN 接口（`can0` 或通道号 `0`）与初始转速（rpm，输出端，默认 10）；
+- 命令行底部始终显示**当前控制的电机 ID**与状态；
+- **↑ 按住 = 逆时针转，↓ 按住 = 顺时针转，松手立即停止**（速度模式，控制线程每 10ms 重发速度指令作心跳）；
+- 快捷键：
+
+| 快捷键 | 功能 |
+|--------|------|
+| `Ctrl+V` | 重新输入转速（rpm，范围 0.1~200） |
+| `Ctrl+1`~`Ctrl+4`（或直接按 `1`~`4`） | 切换控制电机 ID 1~4 |
+| `↑` / `↓` | 按住逆时针 / 顺时针转动，松手即停 |
+| `Ctrl+P` | 打印当前电机信息：电压（V）、电流（A）、位置（相对零位，度）、错误状态 |
+| `h` | 显示帮助 |
+| `q` 或 `Ctrl+C` | 退出（全部电机停止并抱闸） |
+
+**键盘后端（自动选择）**：
+
+- **evdev 后端**（首选）：直接读 `/dev/input/event*`，能拿到真实的按下/松开事件，松手立即停止。需要当前用户在 `input` 组：`sudo usermod -aG input $USER` 后**注销重登**生效；
+- **终端 raw 模式**（回退，普通用户默认）：终端收不到「松开」事件，改用**按键自动重复**推断按住状态——按住方向键时终端持续发重复码维持转动，松手后约 150~200ms 内判定停止。功能完全相同，只是停机有轻微延迟。
+
+**安全参数**（在 [examples/taihu_keyboardctl.cpp](examples/taihu_keyboardctl.cpp:1) 文件开头调整）：
+
+- `kApplyVelocityGains=false`：默认使用电机出厂速度环 PID，不额外下发增益（改为 `true` 可下发 `kVelocityKp/Ki/Kd`）；
+- `kBrakeOnRelease=false`：松手只把目标速度置 0、保持使能（不抱闸），避免频繁抱闸的机械冲击；改为 `true` 则松手立即 `0x02` 去使能抱闸；
+- `kMaxRpm=200`：转速上限，防止误输入飞车。
+
+> 建议首次使用时把腿**悬空**或减小负载，从低转速（如 5 rpm）试起。
 
 ---
 

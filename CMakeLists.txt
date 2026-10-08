@@ -31,6 +31,7 @@ taihu_add_executable(taihu_singleleg_step examples/taihu_singleleg_step.cpp)
 taihu_add_executable(taihu_singleleg_step_xCAN examples/taihu_singleleg_step_xCAN.cpp)
 taihu_add_executable(taihu_single_motorctl examples/taihu_single_motorctl.cpp)
 taihu_add_executable(taihu_single_motorctl_xCAN examples/taihu_single_motorctl_xCAN.cpp)
+taihu_add_executable(taihu_keyboardctl examples/taihu_keyboardctl.cpp)
 
 # —— 工具程序 ——
 # taihu_motor_tools：菜单式工具总入口（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值）
