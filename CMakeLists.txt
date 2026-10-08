@@ -40,3 +40,17 @@ taihu_add_executable(taihu_motor_tools tools/taihu_motor_tools.cpp)
 # —— 鲲弘 CAN 通道控制工具（纯 C，不依赖核心库） ——
 # 用于手动打开/关闭指定 CAN 通道并配置波特率（需要 sudo 运行）
 add_executable(kcanctl tools/kcanctl.c)
+
+# =====================================================================
+# 可选 Qt5 图形界面程序（未安装 Qt5 时自动跳过，不影响其它目标）
+# =====================================================================
+find_package(Qt5 COMPONENTS Widgets QUIET)
+if(Qt5Widgets_FOUND)
+    message(STATUS "Found Qt5 Widgets ${Qt5Widgets_VERSION} -> will build taihu_keyboardctl_ui")
+    # .cpp 内含 Q_OBJECT 类，需要 AUTOMOC 自动生成 moc 并编译
+    set(CMAKE_AUTOMOC ON)
+    taihu_add_executable(taihu_keyboardctl_ui ui/taihu_keyboardctl_ui.cpp)
+    target_link_libraries(taihu_keyboardctl_ui PRIVATE Qt5::Widgets)
+else()
+    message(STATUS "Qt5 Widgets not found -> skip taihu_keyboardctl_ui (install qtbase5-dev to enable)")
+endif()

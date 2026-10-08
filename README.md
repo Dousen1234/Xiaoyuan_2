@@ -485,6 +485,7 @@ cmake --build build
 | `taihu_single_motorctl` | 示例 | 单电机交互式控制（位置/正弦） |
 | `taihu_single_motorctl_xCAN` | 示例 | 多 CAN 总线电机同步控制（每总线一线程，时序对齐） |
 | `taihu_keyboardctl` | 示例 | **键盘交互式控制单腿四电机**（↑↓ 按住转动松手即停，Ctrl+V/1~4/P 切换与查询） |
+| `taihu_keyboardctl_ui` | 示例 | `taihu_keyboardctl` 的 **Qt5 图形界面版**（按住按钮转动、自动刷新电机状态、急停；需 qtbase5-dev，未装自动跳过） |
 | `taihu_motor_tools` | 工具 | **工具总入口（菜单式）**：数字键选总线 + 数字键选工具（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值） |
 | `kcanctl` | 工具 | 鲲弘 CAN 通道控制（打开/关闭通道、配置波特率，需 sudo） |
 
@@ -545,6 +546,9 @@ TaiHu_motor_control/
 │   ├── taihu_single_motorctl.cpp #  单电机交互式控制（位置/正弦）
 │   ├── taihu_single_motorctl_xCAN.cpp # 多总线电机同步控制（每总线一线程）
 │   └── taihu_keyboardctl.cpp    #   键盘交互式控制单腿四电机（按住转动松手即停）
+├── ui/                          # Qt5 图形界面程序
+│   └── taihu_keyboardctl_ui.cpp #   键盘控制 demo 的 GUI 版（worker 线程独占 CAN）
+├── launch_ui.sh                 # GUI 启动脚本（清 snap 环境，VS Code 终端用）
 ├── tools/                       # 命令行工具入口 + 绘图脚本
 │   ├── taihu_motor_tools.cpp    #   工具总入口（菜单式，选总线+选工具）
 │   ├── kcanctl.c                #   鲲弘 CAN 通道控制（打开/关闭/波特率）
@@ -867,6 +871,39 @@ sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 - `kMaxRpm=200`：转速上限，防止误输入飞车。
 
 > 建议首次使用时把腿**悬空**或减小负载，从低转速（如 5 rpm）试起。
+
+### `taihu_keyboardctl_ui`（图形界面版：单腿四电机控制面板）
+
+```bash
+./launch_ui.sh          # VS Code（snap 版）终端里用这个
+./build/taihu_keyboardctl_ui   # 外部系统终端可直接运行
+```
+
+`taihu_keyboardctl` 的 **Qt5 图形界面版本**，功能与命令行版一一对应：
+
+| 命令行版 | 图形界面版 |
+|----------|-----------|
+| 启动输入 CAN 接口 | 顶部「连接」区下拉框（自动枚举 `can*`，未 up 的接口会给出提示）+ 连接按钮 |
+| `Ctrl+V` 改转速 | 「转速设定」数字框 + 滑块 + 快捷预设按钮（1/5/10/30/50/100/200 rpm） |
+| `Ctrl+1`~`4` 切电机 | 「电机选择」四个单选按钮（含减速比显示），或快捷键 `Ctrl+1`~`4` |
+| `↑`/`↓` 按住转动松手即停 | 「▲ 逆时针 / ▼ 顺时针」大按钮**按住转动**，或方向键 `↑`/`↓` |
+| `Ctrl+P` 查看电机信息 | 右侧「当前电机状态」面板：电压/电流/位置/速度/错误位，自动周期刷新 |
+| `q`/`Ctrl+C` 退出 | 关闭窗口 / Esc 急停 / 「■ 急停」按钮 |
+
+**线程模型**：所有 CAN 收发集中在独立的 `MotorWorker` 线程（10ms 心跳定时器），UI 线程绝不直接碰总线——运动命令（转速/电机/方向）通过原子变量传递，按下/松手在 10ms 内生效；状态快照经 Qt 信号回传。转动期间默认暂停状态读取（可勾选打开），保证心跳与松手即停的响应稳定。
+
+**安全设计（多重兜底）**：
+
+1. 按钮 `released()` / 键盘 keyRelease → 方向立即置 0；
+2. 看门狗定时器（80ms）：丢失 released 事件时按 `qApp->mouseButtons()` 强制停机；
+3. **窗口失焦自动停机**（防止用户切走窗口却还按着鼠标）；
+4. 急停按钮 / Esc / Ctrl+C → 全部电机速度置 0 并发 `0x02` 抱闸；
+5. 关闭窗口 → 全部电机停止并抱闸后线程安全退出；
+6. 转速上限 200 rpm，任何确认弹窗弹出前先停止运动。
+
+**snap 版 VS Code 注意**：其终端注入的环境变量会让 Qt 误加载 `/snap/core20` 里的旧 `libpthread` 而报 `symbol lookup error`。请用 [`launch_ui.sh`](launch_ui.sh:1) 启动（自动清理环境），或在外部系统终端直接运行 `./build/taihu_keyboardctl_ui`。
+
+> 构建需要 Qt5 Widgets（`sudo apt install qtbase5-dev`）。未安装时 CMake 自动跳过该目标，不影响其它程序构建。
 
 ---
 
