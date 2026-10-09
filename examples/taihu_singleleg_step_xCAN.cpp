@@ -152,6 +152,11 @@ std::atomic<bool> g_failed{false};    ///< 任一总线准备失败
 std::atomic<bool> g_go{false};        ///< 主线程放行信号
 std::chrono::steady_clock::time_point g_start_time; ///< 统一起跑时刻
 
+// —— 步间确认（按回车开始下一步）的共享状态 ——
+std::atomic<int> g_step_done_count{0};   ///< 已完成步的总线数（单调累计：第 k 步后为 总线数×k）
+std::atomic<int> g_step_release_gen{0};  ///< 步放行代数：主线程每收到一次回车 +1（放行第 k+1 步后为 k）
+std::chrono::steady_clock::time_point g_step_release_time; ///< 最近一次放行时刻（各总线共享，保证同步开跑）
+
 /// 输入一个正整数，带默认值与范围检查。
 int inputInt(const char* prompt, int def, int lo, int hi) {
     std::printf("%s", prompt);
@@ -282,21 +287,53 @@ void busThread(BusCtx& bus) {
         }
     });
 
-    // 7. 发送线程逻辑（当前线程）：按单腿步态轨迹发目标位置
-    const double total = totalSec();   // N 步 × 3 阶段 × kPhaseSec
-    while (true) {
-        const double t = std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - g_start_time).count();
-        if (t >= total) break;  // N 步全部走完
+    // 7. 发送线程逻辑（当前线程）：按单腿步态轨迹发目标位置。
+    //    每一步（3 个阶段）走完后暂停，等待主线程收到回车再同步开始下一步。
+    //    实现方式：以「本步起始时刻 step_time」为时间原点执行本步轨迹；
+    //    某条总线先走完本步后自旋等待，直到主线程放行（刷新 g_step_release_time）。
+    const int total_steps = g_num_steps.load();
+    std::chrono::steady_clock::time_point step_time = g_start_time;  // 当前步的起始时刻
+    for (int step = 1; step <= total_steps; ++step) {
+        const double step_sec = kPhaseSec * kPhasesPerStep;   // 本步时长
 
-        const StepPose pose = computeTarget(t);
+        // 7.1 执行本步轨迹（从 step_time 起算 kPhaseSec×3 秒）
+        while (true) {
+            const double t = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - step_time).count();
+            if (t >= step_sec) break;
 
-        bus.motors[0]->setTargetPosition(pose.id1_deg * kDegToRad);
-        bus.motors[1]->setTargetPosition(pose.id2_deg * kDegToRad);
-        bus.motors[2]->setTargetPosition(pose.id3_deg * kDegToRad);
-        bus.motors[3]->setTargetPosition(pose.id4_deg * kDegToRad);
+            const StepPose pose = computeTarget(t);   // 本步内的相对时间（连续 N 步与原版一致）
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(kLoopPeriodMs));
+            bus.motors[0]->setTargetPosition(pose.id1_deg * kDegToRad);
+            bus.motors[1]->setTargetPosition(pose.id2_deg * kDegToRad);
+            bus.motors[2]->setTargetPosition(pose.id3_deg * kDegToRad);
+            bus.motors[3]->setTargetPosition(pose.id4_deg * kDegToRad);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(kLoopPeriodMs));
+        }
+
+        // 7.2 本步完成：报告并等待主线程收到回车后放行
+        g_step_done_count++;    // 各总线对「完成第 step 步」的计数（主线程按 总线数×step 判断）
+        if (step < total_steps) {
+            std::printf("[%s][信息] 第 %d/%d 步完成，等待回车开始下一步...\n",
+                        bus.ifname.c_str(), step, total_steps);
+            const int release_gen = g_step_release_gen.load();
+            while (g_step_release_gen.load() == release_gen && !g_failed.load())
+                std::this_thread::yield();   // 自旋等主线程放行
+            if (g_failed.load()) {
+                bus.running.store(false);
+                bus.queue_cv.notify_all();
+                recv_thread.join();
+                log_thread.join();
+                bus.logger->close();
+                bus.can.close();
+                return;
+            }
+            step_time = g_step_release_time;   // 以主线程放行时刻为新一步的时间原点
+        } else {
+            std::printf("[%s][信息] 第 %d/%d 步完成，全部步数走完\n",
+                        bus.ifname.c_str(), step, total_steps);
+        }
     }
 
     // 8. 步态结束后，停止该总线全部电机
@@ -376,6 +413,29 @@ int main() {
         std::printf("[信息] 所有总线就绪，%d ms 后同步开始步态\n", kLeadTimeMs);
     } else {
         g_failed = true; // 通知已就绪的线程退出
+    }
+
+    // 5.4 吃掉交互输入阶段 scanf 留在缓冲区里的换行（只做一次，
+    //     否则会与后面每次回车判定混淆）
+    int drain;
+    while ((drain = std::getchar()) != '\n' && drain != EOF) {}
+
+    // 5.5 步间确认：所有总线走完同一步后，等用户敲回车再放行下一步。
+    //     （回车只在这里由主线程读取；各总线线程通过 g_step_release_gen 感知放行。）
+    for (int step = 1; step < num_steps; ++step) {
+        // 等待所有总线完成第 step 步（计数达到 总线数 × step）或任一失败
+        while (g_step_done_count.load() < total * step && !g_failed.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (g_failed.load()) break;
+
+        // 等一次新的回车（敲其它键也会被忽略，直到回车）
+        std::printf(">>> 第 %d/%d 步已全部完成，按回车开始下一步 <<<\n", step, num_steps);
+        int c;
+        do { c = std::getchar(); } while (c != '\n' && c != EOF);
+
+        // 放行：刷新放行时刻并递增代数，所有总线同步开始第 step+1 步
+        g_step_release_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(kLeadTimeMs);
+        g_step_release_gen++;
     }
 
     for (auto& t : threads)
