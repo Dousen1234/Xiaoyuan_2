@@ -1,5 +1,6 @@
 #include "taihu/joint_module.h"
 
+#include <chrono>
 #include <cstdint>
 
 namespace taihu {
@@ -27,7 +28,6 @@ constexpr uint8_t kCmdSetZeroPos  = 0x50; // 编码器归零
 constexpr uint8_t kCmdSetPosOffset= 0x53; // 设置位置偏移值
 constexpr uint8_t kCmdGetPosOffset= 0x54; // 获取当前位置偏移
 
-// 读命令：1 字节（cmd），电机返回 5 字节
 constexpr uint8_t kCmdGetMode     = 0x03; // 获取运行模式
 constexpr uint8_t kCmdGetCurrent  = 0x04; // 获取当前电流 (mA)
 constexpr uint8_t kCmdGetVelocity = 0x06; // 获取当前速度 (0.01 Hz)
@@ -37,6 +37,10 @@ constexpr uint8_t kCmdGetBusVoltage = 0x14; // 获取母线电压 (V)
 constexpr uint8_t kCmdGetCurVelPos  = 0x41; // 获取电流+速度+位置反馈（8 字节回复）
 constexpr uint8_t kCmdSetLowVoltage = 0x89; // 设置低压阈值 (V)
 constexpr uint8_t kCmdGetLowVoltage = 0x8C; // 获取低压阈值 (V)
+
+// 读命令的总超时预算：接收甄别循环最多持续这么久。
+// 取原实现（5 次 × 200ms 重试）的时间量级，语义不变。
+constexpr int kReadTotalTimeoutMs = 1000;
 
 } // namespace
 
@@ -167,26 +171,25 @@ bool JointModule::readCurrentVelocityPosition(int32_t& current_ma,
     can_.drain();
     if (!can_.send(tx)) return false;
 
-    constexpr int kMaxAttempts = 5;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        CanFrame rx;
-        if (!can_.receive(rx, /*timeout_ms=*/200)) continue;
-        if (rx.dlc < 8) continue;
+    // 总超时预算 kReadTotalTimeoutMs，逐帧甄别。总线上可能存在其它节点（如坤维扭矩
+    // 传感器以 100Hz 连续输出，每 10ms 两帧）：无关帧只被跳过、不消耗
+    // 预算，避免它们把有限的重试次数全部吃光导致电机读取失败。
+    if (!receiveMotorFrame(/*want_cmd_echo=*/false, /*expected_cmd=*/0)) return false;
 
-        // 回复 8 字节：电流 int16、速度 int16、位置 int32（小端）
-        const int16_t cur = static_cast<int16_t>(rx.data[0] | (rx.data[1] << 8));
-        const int16_t vel = static_cast<int16_t>(rx.data[2] | (rx.data[3] << 8));
-        const int32_t pos = static_cast<int32_t>(rx.data[4])
-                          | (static_cast<int32_t>(rx.data[5]) << 8)
-                          | (static_cast<int32_t>(rx.data[6]) << 16)
-                          | (static_cast<int32_t>(rx.data[7]) << 24);
+    const CanFrame& rx = last_rx_;
 
-        current_ma     = cur;                 // mA
-        velocity_rad_s = velToRadPerS(vel);   // 0.01Hz -> 输出端 rad/s
-        position_rad   = cntToRad(pos);       // cnt -> rad
-        return true;
-    }
-    return false;
+    // 回复 8 字节：电流 int16、速度 int16、位置 int32（小端）
+    const int16_t cur = static_cast<int16_t>(rx.data[0] | (rx.data[1] << 8));
+    const int16_t vel = static_cast<int16_t>(rx.data[2] | (rx.data[3] << 8));
+    const int32_t pos = static_cast<int32_t>(rx.data[4])
+                      | (static_cast<int32_t>(rx.data[5]) << 8)
+                      | (static_cast<int32_t>(rx.data[6]) << 16)
+                      | (static_cast<int32_t>(rx.data[7]) << 24);
+
+    current_ma     = cur;                 // mA
+    velocity_rad_s = velToRadPerS(vel);   // 0.01Hz -> 输出端 rad/s
+    position_rad   = cntToRad(pos);       // cnt -> rad
+    return true;
 }
 
 bool JointModule::readErrorState(uint32_t& error_bits) {
@@ -234,19 +237,48 @@ bool JointModule::readInt32(uint8_t cmd, int32_t& value) {
 
     if (!can_.send(tx)) return false;
 
-    // 循环接收，跳过非目标功能码的响应帧（如写命令残留的反馈）
-    constexpr int kMaxAttempts = 5;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        CanFrame rx;
-        if (!can_.receive(rx, /*timeout_ms=*/200)) continue; // 超时则继续重试
-        if (rx.dlc < 5) continue;         // 数据不足，继续读
-        if (rx.data[0] != cmd) continue;  // 功能码不匹配（残留帧），跳过
+    // 逐帧甄别直到拿到本电机的响应。总线上可能存在其它节点的帧
+    // （如坤维扭矩传感器 100Hz 连续输出：ID 0x15、7 字节、第 1 字节
+    // 为 0x00~0xFF 循环的同步数——恰好可能撞上功能码），必须按
+    // 「帧 ID == rx_id_ 且功能码回显匹配」双重甄别，否则传感器帧
+    // 会被误解析成电机数据；同时无关帧不消耗时间预算，避免它们
+    // 把重试次数吃光导致读取失败。
+    if (!receiveMotorFrame(/*want_cmd_echo=*/true, cmd)) return false;
 
-        // 第 1 字节功能码回显，后 4 字节为小端 int32
-        value = static_cast<int32_t>(rx.data[1])
-              | (static_cast<int32_t>(rx.data[2]) << 8)
-              | (static_cast<int32_t>(rx.data[3]) << 16)
-              | (static_cast<int32_t>(rx.data[4]) << 24);
+    const CanFrame& rx = last_rx_;
+
+    // 第 1 字节功能码回显，后 4 字节为小端 int32
+    value = static_cast<int32_t>(rx.data[1])
+          | (static_cast<int32_t>(rx.data[2]) << 8)
+          | (static_cast<int32_t>(rx.data[3]) << 16)
+          | (static_cast<int32_t>(rx.data[4]) << 24);
+    return true;
+}
+
+// 逐帧接收并甄别，直到匹配本电机（rx_id_）的响应帧或超时。
+//   want_cmd_echo=true：要求第 1 字节 == expected_cmd（读命令回显）；
+//   want_cmd_echo=false：不检查功能码（0x41 三合一回复无功能码回显，
+//                        只要求 8 字节 + ID 匹配）。
+// 无关节点帧只被丢弃，不消耗时间预算。
+bool JointModule::receiveMotorFrame(bool want_cmd_echo, uint8_t expected_cmd) {
+    constexpr int kPerFrameTimeoutMs = 200;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kReadTotalTimeoutMs);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        CanFrame rx;
+        if (!can_.receive(rx, kPerFrameTimeoutMs)) continue;  // 超时重试
+
+        if (rx.id != rx_id_) continue;   // 其它节点的帧（如传感器 0x15），跳过
+
+        if (want_cmd_echo) {
+            if (rx.dlc < 5) continue;            // 数据不足，跳过
+            if (rx.data[0] != expected_cmd) continue;  // 功能码不匹配，跳过
+        } else {
+            if (rx.dlc < 8) continue;            // 三合一回复需 8 字节
+        }
+
+        last_rx_ = rx;
         return true;
     }
     return false;

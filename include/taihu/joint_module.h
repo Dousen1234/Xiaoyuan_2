@@ -137,11 +137,20 @@ private:
     uint32_t rx_id_;                 ///< 接收 CAN ID
     double gear_ratio_ = kDefaultGearRatio;
 
+    /// 最近一次甄别成功的电机响应帧（receiveMotorFrame 填写）。
+    /// 引入它是为了在「总线上混有扭矩传感器等其它节点帧」时，
+    /// 先按 rx_id_ + 功能码甄别、再把结果交给各读函数解析。
+    CanFrame last_rx_;
+
     /// 发送 5 字节写命令: [cmd][int32 小端数据]。
     bool sendWriteCmd(uint8_t cmd, int32_t data);
 
     /// 发送 1 字节读命令，接收 5 字节返回并解析出 int32。
     bool readInt32(uint8_t cmd, int32_t& value);
+
+    /// 逐帧接收并甄别，直到匹配本电机（rx_id_）的响应帧或超时。
+    /// 详见 joint_module.cpp 实现处的注释（多节点总线的帧甄别）。
+    bool receiveMotorFrame(bool want_cmd_echo, uint8_t expected_cmd);
 
     /// 弧度（输出端）-> 编码 cnt（双编码器）。
     static int32_t radToCnt(double rad);
