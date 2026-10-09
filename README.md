@@ -26,6 +26,7 @@
 - [日志与绘图](#日志与绘图)
 - [协议要点](#协议要点)
 - [常见问题排查](#常见问题排查)
+- [ROS2 集成](#ros2-集成)
 - [参考资料](#参考资料)
 
 ---
@@ -997,6 +998,47 @@ python3 tools/plot_motor_log.py record/motor_log_can0.csv --num-steps 3   # xCAN
 | 主程序无法正常结束 | 记录线程条件变量未唤醒 | 已在 `running=false` 后 `notify_all`，请确认使用最新代码 |
 
 > `taihu_motor_tools` 菜单选 `2`（通信诊断）是排查的第一手段，可读取位置、偏移、错误状态等关键信息。
+
+---
+
+## ROS2 集成
+
+ROS2 Jazzy 功能包位于 `ros2_ws/src/taihu_ros2/`，**直接编译仓库根目录源码**（不复制代码，`taihu_core` 单一事实来源）。话题/服务/参数速查表与常见问题见 `ros2_ws/src/taihu_ros2/README.md`。
+
+### 节点架构
+
+| 节点 | 职责 |
+|------|------|
+| `taihu_motor_node` | 一条 CAN 总线 = 一条腿。独立 200Hz 控制线程（不占 ROS 执行器），`0x41` 三合一读电流/速度/位置，200Hz 发布 `sensor_msgs/JointState`；`~/enable` 前不下发任何指令（安全联锁），`~/stop` 或退出即抱闸 |
+| `taihu_gait_node` | 复用终端 demo 步态（3 阶段 × 五次多项式插值），发 `command_position` 给电机节点；`pause_after_swing=true` 时每步正摆后暂停，等 `~/resume` 放行（对应原「回车放行」） |
+
+### 使用流程
+
+```bash
+# 0. 外部终端打开 CAN（snap VS Code 不能 sudo）
+sudo ./build/kcanctl up can0 1000000
+
+# 1. 构建（仓库根目录下）
+cd ros2_ws && source /opt/ros/jazzy/setup.bash && colcon build --packages-select taihu_ros2
+
+# 2. 启动（每次开新终端都要 source）
+source install/setup.bash
+ros2 launch taihu_ros2 gait.launch.py can:=can0        # 可选 steps:=3 phase_sec:=3.0 pause:=false
+
+# 3. 另一终端（同样 source）：使能 → 跑步态 → 放行回摆
+ros2 service call /taihu_motor_node/enable std_srvs/srv/Trigger {}
+ros2 service call /taihu_gait_node/start_gait std_srvs/srv/Trigger {}
+ros2 service call /taihu_gait_node/resume std_srvs/srv/Trigger {}     # 正摆暂停时放行
+ros2 service call /taihu_gait_node/stop_gait std_srvs/srv/Trigger {}  # 停止步态
+ros2 service call /taihu_motor_node/stop std_srvs/srv/Trigger {}      # 紧急抱闸
+
+# 4. 观察
+ros2 topic echo /taihu_motor_node/joint_states
+ros2 topic echo /taihu_gait_node/gait_state
+```
+
+> ⚠️ 电机节点独占 CAN 接口：**不要同时运行终端 demo 和 ROS 节点**（两个进程抢同一 socket）。手动点动：`ros2 topic pub /taihu_motor_node/command_position sensor_msgs/msg/JointState "{position: [0.0, 0.5, 0.5, 0.0]}" -1`（先 `~/enable`）。
+> 坤维传感器返厂（改 1M 波特率 + ID 5~8）后并入 can0，再扩展力矩话题。
 
 ---
 
