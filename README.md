@@ -488,6 +488,7 @@ cmake --build build
 | `taihu_keyboardctl` | 示例 | **键盘交互式控制单腿四电机**（↑↓ 按住转动松手即停，Ctrl+V/1~4/P 切换与查询） |
 | `taihu_keyboardctl_ui` | 示例 | `taihu_keyboardctl` 的 **Qt5 图形界面版**（按住按钮转动、自动刷新电机状态、急停；需 qtbase5-dev，未装自动跳过） |
 | `taihu_motor_tools` | 工具 | **工具总入口（菜单式）**：数字键选总线 + 数字键选工具（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值） |
+| `taihu_mpt_encoder` | 工具 | **MPT 磁编码器调试**（自动探测/设零位/改地址，RS485 总线，独立于 CAN） |
 | `kcanctl` | 工具 | 鲲弘 CAN 通道控制（打开/关闭通道、配置波特率，需 sudo） |
 
 ---
@@ -552,6 +553,8 @@ TaiHu_motor_control/
 ├── launch_ui.sh                 # GUI 启动脚本（清 snap 环境，VS Code 终端用）
 ├── tools/                       # 命令行工具入口 + 绘图脚本
 │   ├── taihu_motor_tools.cpp    #   工具总入口（菜单式，选总线+选工具）
+│   ├── taihu_torque_sensor.cpp  #   扭矩传感器独立查看工具
+│   ├── taihu_mpt_encoder.cpp    #   MPT 磁编码器独立调试工具（设零位/改地址）
 │   ├── kcanctl.c                #   鲲弘 CAN 通道控制（打开/关闭/波特率）
 │   └── plot_motor_log.py        #   日志绘图脚本（Python + matplotlib）
 ├── deploy/                      # 可选的 udev 自动配置规则（默认不启用）
@@ -1082,6 +1085,83 @@ ros2 service call /taihu_motor_node/torque_zero std_srvs/srv/Trigger {}   # 零�
 
 ---
 
+## MPT 磁编码器（金钢，RS485 接口）
+
+**关节端外置编码器**，24 位单圈绝对值（±0.01°），走 RS485 总线（`/dev/ttyUSB*`，USB 转 485），**与 CAN 电机总线完全独立**。协议与线序依据《MPT磁编码器数据手册v0.6.pdf》（仓库根目录）。
+
+### 协议要点
+
+| 项 | 值 |
+|---|---|
+| 电气 | 4.5~5.5VDC（约 100mA）、**编码器端 A/B 已内置终端电阻**（控制器侧需外加 120Ω） |
+| 波特率代号 | 型号末段：M=2,500,000（**默认**）/ V=5,000,000 / A=115,200 |
+| UART 格式 | 8N1，无流控，LSB 优先 |
+| 接口型号 | **R（RS485）**：单字节命令，无地址（**总线只能挂 1 台**）；**D（BUS）**：带 5 位地址（出厂 `0x1F`），**多台可共 A/B 总线**（需先逐台改不同地址） |
+| 读位置 | R 款 `0x31`（返回 5 字节 `A2 A1 A0 S CRC`）；D 款操作类型 `00` 获取信息（返回 `S A0 A1 A2 CRC`） |
+| CRC-8 | 多项式 $x^8+x^7+x^4+x^2+x+1$（手册附 256 项查表） |
+| 设零位 | R 款 `0x31`/`0x30` 交替 ≥10 次；D 款操作 00/01 交替。**约 50ms 生效期内编码器不响应任何命令** |
+| 角度换算 | `angle = raw / 2^24 * 360`（度） |
+
+状态字节 S：b7=错误（数据不可信）、b6=警告（数据仍有效）、b5~b0 状态位。
+
+### 接线
+
+编码器 8 针连接器（RS485 两线制只需 4 根）：
+
+| 编码器线 | 功能 | 接 USB 转 485 |
+|---|---|---|
+| 红（Pin8） | +5V | 转接头 5V 输出（多数转接头**不提供**，需独立 5V 供电并共地） |
+| 黑（Pin7） | GND | GND |
+| 蓝（Pin6） | A(+) | A / D+ |
+| 绿（Pin5） | B(−) | B / D− |
+
+- **两台共总线**：两台编码器的 A 并 A、B 并 B（菊花链或星形均可，总长 < 50m），再接到同一个 USB 转 485。
+- **终端电阻**：编码器端已内置；控制器侧在 A/B 之间加 120Ω（若转接头板载开关可打开）。
+- 屏蔽层在驱动端（控制器侧）单点接地。
+
+### USB 转 485 选型
+
+| 编码器波特率代号 | 波特率 | 转接头要求 |
+|---|---|---|
+| M（默认） | 2.5 Mbps | **FT232H/FT2232H 类高速款**（支持 2M+ 自定义波特率）；CP2102/CH340 等普通款到不了 2.5M |
+| V | 5 Mbps | 同上高速款（接近上限，不稳则降到 M） |
+| A | 115200 | 普通款即可 |
+
+> 普通转接头到手后先用 `stty -F /dev/ttyUSB0` 查最大支持；2.5M 波特率需在 Linux 用 `BOTHER` 任意波特率（驱动已实现）。不确定型号时，**到手先用工具自动探测**（见下节），M/A 两种都试。
+
+### 两台共总线操作流程（D 款）
+
+出厂地址都是 `0x1F`，**必须先逐台改地址**（否则两台同时应答会冲突）：
+
+1. **单台**接 USB 转 485（只接第一台），运行工具，按 `d` 改地址 → 输入 `5`；
+2. 断电，换**第二台**单接，运行工具，按 `d` → 输入 `6`；
+3. 两台并到同一对 A/B，运行工具指定地址列表（或 ROS 节点 `enc_addrs:="[5, 6]"`）即可区分。
+
+R 款两台**不能**共总线（无地址概念），需要两条独立总线/两个转接头。
+
+### 独立终端工具
+
+```bash
+./build/taihu_mpt_encoder [device] [baud] [bus_addr]
+# 例：
+./build/taihu_mpt_encoder /dev/ttyUSB0 2500000        # 自动探测（R 款或 D 款 0x1F）
+./build/taihu_mpt_encoder /dev/ttyUSB0 2500000 5      # D 款已改地址 5
+```
+
+单键操作：`z` 设零位 / `d` 改地址（D 款）/ `w` 开关 CSV 日志（`record/encoder_log.csv`）/ `q` 退出。实时显示角度、原始值、状态位、错误/警告、采样率。
+
+### ROS2 集成（独立节点）
+
+```bash
+ros2 run taihu_ros2 taihu_encoder_node --ros-args -p serial_port:=/dev/ttyUSB0 -p enc_addrs:="[5, 6]"
+ros2 topic echo /taihu_encoder_node/angle          # Float64MultiArray，单位度
+ros2 service call /taihu_encoder_node/zero std_srvs/srv/Trigger {}
+```
+
+话题/参数详见 `ros2_ws/src/taihu_ros2/README.md`。
+
+---
+
 ## 参考资料
 
 项目根目录包含以下厂家资料（协议文档与调试截图，供开发参考）：
@@ -1091,6 +1171,7 @@ ros2 service call /taihu_motor_node/torque_zero std_srvs/srv/Trigger {}   # 零�
 - `位置模式示例.pdf`、`公式换算.docx`、`扭矩系数.xlsx`
 - `低压阈值调整.docx`、`电流绝对值阈值.docx`、`产品信息册.xlsx`
 - `CAN-2Frames-Torque and Voltage-HIT-V2.0.pdf`（坤维扭矩传感器 CAN 协议 V2.0）
+- `MPT磁编码器数据手册v0.6.pdf`（金钢 MPT 磁编码器协议与线序）
 - `taihu_breakcontrol1.jpeg`、`taihu_breakcontrol2.jpeg`（刹车控制调试截图）
 
 鲲弘 KH-UCANFDX6-Mini 设备资料（`KH-UCANFDXn-Mini 系列多路CANFD扩展模块配套资料/` 目录内）：

@@ -23,6 +23,7 @@ add_library(taihu_core_ros STATIC
     ${TAIHU_CORE_DIR}/src/taihu_tools.cpp
     ${TAIHU_CORE_DIR}/src/motor_logger.cpp
     ${TAIHU_CORE_DIR}/src/torque_sensor.cpp
+    ${TAIHU_CORE_DIR}/src/mpt_encoder.cpp
 )
 target_include_directories(taihu_core_ros PUBLIC
     ${TAIHU_CORE_DIR}/include
@@ -45,7 +46,15 @@ add_executable(taihu_gait_node src/taihu_gait_node.cpp)
 target_link_libraries(taihu_gait_node taihu_core_ros)
 ament_target_dependencies(taihu_gait_node rclcpp sensor_msgs std_srvs std_msgs)
 
-install(TARGETS taihu_motor_node taihu_gait_node
+# =====================================================================
+# 编码器器节点：金钢 MPT 磁编码器（RS485 串口，独立于 CAN 电机总线），
+# 支持一台（R 款自动探测）或多台（D 款按 enc_addrs 地址轮询）
+# =====================================================================
+add_executable(taihu_encoder_node src/taihu_encoder_node.cpp)
+target_link_libraries(taihu_encoder_node taihu_core_ros)
+ament_target_dependencies(taihu_encoder_node rclcpp sensor_msgs std_srvs)
+
+install(TARGETS taihu_motor_node taihu_gait_node taihu_encoder_node
         DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch/

@@ -23,6 +23,32 @@
 
 参数：`can_ifname`（默认 `can0`）、`position_kp`（4000）、`position_kd`（60）、`control_rate_hz`（200）、`use_torque_sensor`（**默认 false**，保持传感器完全独立）、`sensor_rx_id`（0x10）、`sensor_tx_id`（0x15）、`sensor_output_rate`（"100"/"200"/"250"/"400" Hz）
 
+### `taihu_encoder_node` —— MPT 磁编码器节点（RS485 串口，独立于 CAN）
+
+金钢 MPT 磁编码器（24 位单圈绝对值），走 `/dev/ttyUSB*`（USB 转 485），与电机 CAN 总线完全独立。支持一台 R 款（自动探测）或多台 D 款（按地址轮询）。
+
+| 接口 | 类型 | 说明 |
+|---|---|---|
+| `~/angle` | topic, Float64MultiArray | 各编码器单圈角度（度，0~360），顺序与 `enc_addrs` 一致 |
+| `~/samples` | topic, JointState | name=`enc<addr>`，position=角度（度） |
+| `~/zero` | service, Trigger | 全部编码器设零位 |
+| `~/zero_one` | service, SetBool | data=true 设第一台 / false 设第二台 |
+
+参数：`serial_port`（`/dev/ttyUSB0`）、`baud`（2500000，型号代号 M）、`rate_hz`（200）、`enc_addrs`（**空 = 自动探测 1 台**；两台 D 款传 `[5, 6]` 即地址列表）
+
+```bash
+# 单台 R 款（自动探测）
+ros2 run taihu_ros2 taihu_encoder_node --ros-args -p serial_port:=/dev/ttyUSB0
+
+# 两台 D 款（已改地址 5 和 6）
+ros2 run taihu_ros2 taihu_encoder_node --ros-args -p serial_port:=/dev/ttyUSB0 -p enc_addrs:="[5, 6]"
+
+# 查看
+ros2 topic echo /taihu_encoder_node/angle
+```
+
+> 两台 D 款出厂地址都是 0x1F，**必须先单台改地址**再并总线——用 `./build/taihu_mpt_encoder` 的 `d` 命令，详见主 README 编码器章节。
+
 ### `taihu_gait_node` —— 步态播放节点
 
 复用终端 demo 的单腿步态（一步 = 3 阶段：零位保持 → 正摆 0°→180° → 回摆），轨迹参数可调。

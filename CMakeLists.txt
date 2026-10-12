@@ -14,6 +14,7 @@ add_library(taihu_core STATIC
     src/taihu_tools.cpp       # 工具函数封装（诊断/标零/旋转等）
     src/motor_logger.cpp      # 实时日志记录
     src/torque_sensor.cpp     # 坤维扭矩传感器（HIT-V2.0，可与电机共总线）
+    src/mpt_encoder.cpp       # 金钢 MPT 磁编码器（RS485，独立于 CAN 总线）
 )
 target_include_directories(taihu_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -40,6 +41,9 @@ taihu_add_executable(taihu_motor_tools tools/taihu_motor_tools.cpp)
 
 # taihu_torque_sensor：坤维扭矩传感器独立查看工具（与主控制程序共总线、互不干扰）
 taihu_add_executable(taihu_torque_sensor tools/taihu_torque_sensor.cpp)
+
+# taihu_mpt_encoder：金钢 MPT 磁编码器独立查看工具（RS485 串口，独立于 CAN）
+taihu_add_executable(taihu_mpt_encoder tools/taihu_mpt_encoder.cpp)
 
 # —— 鲲弘 CAN 通道控制工具（纯 C，不依赖核心库） ——
 # 用于手动打开/关闭指定 CAN 通道并配置波特率（需要 sudo 运行）
