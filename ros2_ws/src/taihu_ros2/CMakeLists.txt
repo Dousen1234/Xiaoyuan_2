@@ -22,6 +22,7 @@ add_library(taihu_core_ros STATIC
     ${TAIHU_CORE_DIR}/src/joint_module.cpp
     ${TAIHU_CORE_DIR}/src/taihu_tools.cpp
     ${TAIHU_CORE_DIR}/src/motor_logger.cpp
+    ${TAIHU_CORE_DIR}/src/torque_sensor.cpp
 )
 target_include_directories(taihu_core_ros PUBLIC
     ${TAIHU_CORE_DIR}/include

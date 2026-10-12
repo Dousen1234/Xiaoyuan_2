@@ -18,8 +18,10 @@
 | `~/enable` | service, Trigger | 下发增益并使能控制循环 |
 | `~/stop` | service, Trigger | 停止全部电机（抱闸） |
 | `~/set_gains` | service, Trigger | 重新下发 KP/KD（运行中改参数后调用） |
+| `~/torque` | topic, Float64 | 扭矩传感器读数（Nm），启用 `use_torque_sensor` 后发布 |
+| `~/torque_zero` | service, Trigger | 扭矩传感器零偏校准（采 100 个样本取平均） |
 
-参数：`can_ifname`（默认 `can0`）、`position_kp`（4000）、`position_kd`（60）、`control_rate_hz`（200）
+参数：`can_ifname`（默认 `can0`）、`position_kp`（4000）、`position_kd`（60）、`control_rate_hz`（200）、`use_torque_sensor`（**默认 false**，保持传感器完全独立）、`sensor_rx_id`（0x10）、`sensor_tx_id`（0x15）、`sensor_output_rate`（"100"/"200"/"250"/"400" Hz）
 
 ### `taihu_gait_node` —— 步态播放节点
 
@@ -64,10 +66,23 @@ ros2 topic echo /taihu_gait_node/gait_state
 # 可视化（plotjuggler 可订阅 JointState）
 ```
 
-launch 参数：`can`、`kp`、`kd`、`rate`、`steps`、`phase_sec`、`pause`，如：
+launch 参数：`can`、`kp`、`kd`、`rate`、`steps`、`phase_sec`、`pause`、`torque`，如：
 
 ```bash
-ros2 launch taihu_ros2 gait.launch.py can:=can0 steps:=3 phase_sec:=3.0 pause:=false```
+ros2 launch taihu_ros2 gait.launch.py can:=can0 steps:=3 phase_sec:=3.0 pause:=false
+
+# 需要扭矩数据时（opt-in，不影响默认行为）
+ros2 launch taihu_ros2 gait.launch.py torque:=true
+ros2 topic echo /taihu_motor_node/torque
+# 零偏校准（传感器空载、稳定后执行）
+ros2 service call /taihu_motor_node/torque_zero std_srvs/srv/Trigger {}
+```
+
+## 扭矩传感器
+
+传感器挂在电机同一条总线（can0），靠帧 ID 甄别互不干扰：传感器只认自己 Tx_ID（默认 0x15）的 7 字节帧，电机只认电机 ID 的回复。**不用传感器时不设 `torque:=true` 即可，总线完全无额外流量。**
+
+也可以不跑 ROS，直接用独立终端工具（`./build/taihu_torque_sensor can0`），详见主 README 的扭矩传感器章节——工具与 ROS 节点**不要同时用**（都会向传感器发 0x48 启动命令，状态会互相覆盖）。
 
 ## 安全提醒
 
@@ -75,6 +90,7 @@ ros2 launch taihu_ros2 gait.launch.py can:=can0 steps:=3 phase_sec:=3.0 pause:=f
 2. 紧急停止：`~/stop` 服务，或直接 `Ctrl+C`（节点析构会 stop 全部电机）
 3. 电机节点独占 CAN 接口：**不要同时运行终端 demo 和 ROS 节点**（两个进程抢同一 socket，都会乱）
 4. 接口名按实际连接改：`can1` 就 `ros2 launch ... can:=can1`
+5. `torque:=true` 时传感器须已在总线上且供电正常（9~30VDC）；节点退出时会自动向传感器发 0x43 停止输出
 
 ## 常见问题
 

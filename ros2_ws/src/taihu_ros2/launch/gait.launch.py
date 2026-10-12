@@ -1,7 +1,7 @@
 """启动钛虎单腿步态：电机驱动节点 + 步态播放节点。
 
 用法示例：
-    ros2 launch taihu_ros2 gait.launch.py can:=can0 steps:=3 phase_sec:=3.0 pause:=false
+    ros2 launch taihu_ros2 gait.launch.py can:=can0 steps:=3 phase_sec:=3.0 pause:=false torque:=false
 """
 
 from launch import LaunchDescription
@@ -34,6 +34,8 @@ def generate_launch_description():
                               description='每阶段时长（秒）'),
         DeclareLaunchArgument('pause', default_value='true',
                               description='正摆后是否暂停等 ~/resume 放行'),
+        DeclareLaunchArgument('torque', default_value='false',
+                              description='是否启用坤维扭矩传感器（默认独立不用，需要时开）'),
 
         # 电机驱动节点：CAN + 四电机，200Hz JointState，~/enable 后开始控制
         Node(
@@ -46,6 +48,7 @@ def generate_launch_description():
                 'position_kp': kp,
                 'position_kd': kd,
                 'control_rate_hz': rate,
+                'use_torque_sensor': LaunchConfiguration('torque'),
             }],
         ),
 

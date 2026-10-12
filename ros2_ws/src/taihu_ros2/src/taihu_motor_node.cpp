@@ -28,12 +28,14 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "std_msgs/msg/float64.hpp"
 #include "std_srvs/srv/trigger.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 
 #include "taihu/config.h"
 #include "taihu/joint_module.h"
 #include "taihu/socket_can.h"
+#include "taihu/torque_sensor.h"
 
 namespace {
 
@@ -44,6 +46,10 @@ using std_srvs::srv::Trigger;
 const std::vector<uint32_t> kMotorIds    = {1, 2, 3, 4};
 const std::vector<double>   kGearRatios  = {101.0, 81.0, 81.0, 101.0};
 const std::vector<std::string> kJointNames = {"joint1", "joint2", "joint3", "joint4"};
+
+// 坤维扭矩传感器默认 ID（HIT-V2.0：Rx=0x10 命令 / Tx=0x15 回复）
+constexpr uint32_t kDefaultSensorRxId = 0x10;
+constexpr uint32_t kDefaultSensorTxId = 0x15;
 
 } // namespace
 
@@ -58,6 +64,11 @@ public:
         pos_kp_     = declare_parameter<int>("position_kp", 4000);
         pos_kd_     = declare_parameter<int>("position_kd", 60);
         rate_hz_    = declare_parameter<int>("control_rate_hz", 200);
+        // 扭矩传感器（可选，默认关闭——与电机控制完全独立，需要时再开）
+        use_torque_sensor_ = declare_parameter<bool>("use_torque_sensor", false);
+        sensor_rx_id_ = declare_parameter<int>("sensor_rx_id", kDefaultSensorRxId);
+        sensor_tx_id_ = declare_parameter<int>("sensor_tx_id", kDefaultSensorTxId);
+        sensor_rate_  = declare_parameter<std::string>("sensor_output_rate", "100");
 
         // —— CAN 与电机初始化 ——
         if (!can_.open(can_ifname_.c_str(), 0)) {
@@ -74,6 +85,34 @@ public:
         }
         RCLCPP_INFO(get_logger(), "CAN %s 就绪，%zu 个电机（ID 1~4）已初始化",
                     can_ifname_.c_str(), joints_.size());
+
+        // —— 扭矩传感器（可选）：独立接收线程，只认 Tx_ID 的 7 字节帧 ——
+        if (use_torque_sensor_) {
+            taihu::TorqueSensor::OutputRate rate = taihu::TorqueSensor::OutputRate::Hz100;
+            if      (sensor_rate_ == "200") rate = taihu::TorqueSensor::OutputRate::Hz200;
+            else if (sensor_rate_ == "250") rate = taihu::TorqueSensor::OutputRate::Hz250;
+            else if (sensor_rate_ == "400") rate = taihu::TorqueSensor::OutputRate::Hz400;
+
+            sensor_ = std::make_unique<taihu::TorqueSensor>(
+                can_, static_cast<uint32_t>(sensor_rx_id_),
+                static_cast<uint32_t>(sensor_tx_id_));
+            sensor_->startRxThread();
+            if (!sensor_->startContinuous(rate)) {
+                RCLCPP_WARN(get_logger(), "扭矩传感器连续输出命令发送失败");
+            } else {
+                RCLCPP_INFO(get_logger(), "扭矩传感器已启动（Rx=0x%02X Tx=0x%02X %sHz 连续输出）",
+                            static_cast<unsigned>(sensor_rx_id_),
+                            static_cast<unsigned>(sensor_tx_id_), sensor_rate_.c_str());
+            }
+            torque_pub_ = create_publisher<std_msgs::msg::Float64>("~/torque", 10);
+            zero_srv_ = create_service<Trigger>(
+                "~/torque_zero", [this](const Trigger::Request::SharedPtr,
+                                        Trigger::Response::SharedPtr res) {
+                    sensor_->startZeroCalib(100);
+                    res->success = true;
+                    res->message = "零偏校准开始（采 100 个样本取平均，保持空载）";
+                });
+        }
 
         // —— 发布 / 订阅 / 服务 ——
         joint_state_pub_ = create_publisher<sensor_msgs::msg::JointState>("~/joint_states", 10);
@@ -122,6 +161,10 @@ public:
     ~MotorNode() override {
         running_ = false;
         if (ctrl_thread_.joinable()) ctrl_thread_.join();
+        if (sensor_) {
+            sensor_->stopOutput();      // 让传感器停止输出（其它进程仍可随时唤醒它）
+            sensor_->stopRxThread();
+        }
         for (auto& j : joints_) j->stop();
         can_.close();
     }
@@ -164,6 +207,16 @@ private:
             js.header.stamp = this->now();
             joint_state_pub_->publish(js);
 
+            // —— 扭矩传感器发布（若启用）：有新鲜样本才发 ——
+            if (sensor_ && torque_pub_) {
+                taihu::TorqueSensor::Sample ts;
+                if (sensor_->latest(ts, 250)) {
+                    std_msgs::msg::Float64 msg;
+                    msg.data = ts.torque_nm;
+                    torque_pub_->publish(msg);
+                }
+            }
+
             // —— 控制下发 ——
             if (enable_.load()) {
                 std::lock_guard<std::mutex> lock(cmd_mutex_);
@@ -194,7 +247,14 @@ private:
     rclcpp::Service<Trigger>::SharedPtr enable_srv_;
     rclcpp::Service<Trigger>::SharedPtr stop_srv_;
     rclcpp::Service<Trigger>::SharedPtr set_gains_srv_;
-};
+
+    // —— 扭矩传感器（可选）——
+    bool use_torque_sensor_ = false;
+    int sensor_rx_id_ = kDefaultSensorRxId, sensor_tx_id_ = kDefaultSensorTxId;
+    std::string sensor_rate_ = "100";
+    std::unique_ptr<taihu::TorqueSensor> sensor_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr torque_pub_;
+    rclcpp::Service<Trigger>::SharedPtr zero_srv_;};
 
 } // namespace taihu_ros
 

@@ -1038,7 +1038,47 @@ ros2 topic echo /taihu_gait_node/gait_state
 ```
 
 > ⚠️ 电机节点独占 CAN 接口：**不要同时运行终端 demo 和 ROS 节点**（两个进程抢同一 socket）。手动点动：`ros2 topic pub /taihu_motor_node/command_position sensor_msgs/msg/JointState "{position: [0.0, 0.5, 0.5, 0.0]}" -1`（先 `~/enable`）。
-> 坤维传感器返厂（改 1M 波特率 + ID 5~8）后并入 can0，再扩展力矩话题。
+> 扭矩传感器 ROS 集成：`ros2 launch taihu_ros2 gait.launch.py torque:=true` 发布 `~/torque` 话题（详见 ros2_ws/src/taihu_ros2/README.md）。
+
+---
+
+## 扭矩传感器（坤维 HIT-V2.0 协议）
+
+传感器与电机共用一条总线（can0，1Mbps），**完全独立、随时启停**：靠双向帧甄别互不干扰——传感器只认自己 Tx_ID（默认 `0x15`）的 7 字节帧，电机驱动只认电机 ID（1~4）的回复。不用传感器时总线零额外流量。
+
+### 协议要点
+
+| 项 | 值 |
+|---|---|
+| 默认波特率 | 1000kbps（与电机总线一致，直接挂即可） |
+| 命令 ID（Rx_ID） | `0x10`；回复 ID（Tx_ID） | `0x15`（不与电机 1~4 冲突） |
+| 单次查询 | `49 AA 0D 0A`（发往 Rx_ID） |
+| 连续输出 | `48 AA <rate> 0D 0A`，rate：00=100Hz / 01=200Hz / 02=250Hz / 03=400Hz |
+| 停止输出 | `43 AA 0D 0A`（工具/节点退出时自动发） |
+| 数据帧 | 每次 2 帧 × 7 字节，帧 ID=Tx_ID；第 0 字节同步数（同数两帧配对）；命令码 `0x48`/`0x49`；第 2 字节 `0xAA`→后 4 字节扭矩（float 小端，Nm），`0xBB`→后 4 字节桥压（mV/V） |
+| 供电 | 9~30VDC，<2W；**不内置终端电阻**（挂物理末端需外加 120Ω） |
+
+上电初期零点漂移 → 空载稳定后做一次零偏校准。
+
+### 独立终端工具（与任何主控制程序并行使用）
+
+```bash
+./build/taihu_torque_sensor can0            # 可选第二、三参数：rx_id tx_id（默认 0x10 0x15）
+```
+
+单键操作：`s` 开始 100Hz 连续输出 / `t` 停止 / `z` 零偏校准（100 样本）/ `w` 开关 CSV 日志（`record/torque_log.csv`）/ `q` 退出。运行时实时显示扭矩、原始值、桥压与采样率。
+
+**与主控制程序的关系**：工具是独立进程，Linux 给每个 CAN raw socket 各投一份帧——终端 demo、ROS 节点、工具可同跑在各自进程里互不抢 socket；唯一约束是**别同时用两个"传感器客户端"**（工具 + ROS `torque:=true`），它们都会向传感器发 0x48 启动命令，会互相覆盖输出状态。
+
+### ROS2 集成（opt-in）
+
+```bash
+ros2 launch taihu_ros2 gait.launch.py torque:=true
+ros2 topic echo /taihu_motor_node/torque                    # std_msgs/Float64，单位 Nm
+ros2 service call /taihu_motor_node/torque_zero std_srvs/srv/Trigger {}   # 零偏校准
+```
+
+不设 `torque:=true` 时节点行为与之前完全一致（默认 `use_torque_sensor=false`）。
 
 ---
 
@@ -1050,6 +1090,7 @@ ros2 topic echo /taihu_gait_node/gait_state
 - `电机协议_双编_Can版本_20250623.xlsx`（CAN 命令集）
 - `位置模式示例.pdf`、`公式换算.docx`、`扭矩系数.xlsx`
 - `低压阈值调整.docx`、`电流绝对值阈值.docx`、`产品信息册.xlsx`
+- `CAN-2Frames-Torque and Voltage-HIT-V2.0.pdf`（坤维扭矩传感器 CAN 协议 V2.0）
 - `taihu_breakcontrol1.jpeg`、`taihu_breakcontrol2.jpeg`（刹车控制调试截图）
 
 鲲弘 KH-UCANFDX6-Mini 设备资料（`KH-UCANFDXn-Mini 系列多路CANFD扩展模块配套资料/` 目录内）：
