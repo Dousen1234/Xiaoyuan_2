@@ -45,6 +45,10 @@ taihu_add_executable(taihu_torque_sensor tools/taihu_torque_sensor.cpp)
 # taihu_mpt_encoder：金钢 MPT 磁编码器独立查看工具（RS485 串口，独立于 CAN）
 taihu_add_executable(taihu_mpt_encoder tools/taihu_mpt_encoder.cpp)
 
+# taihu_encoder_can_bridge：MPT 编码器 → CAN 软件网关（RS485 读数转 CAN 帧，
+# 与电机/扭矩传感器共总线，帧 ID 甄别互不干扰）
+taihu_add_executable(taihu_encoder_can_bridge tools/taihu_encoder_can_bridge.cpp)
+
 # —— 鲲弘 CAN 通道控制工具（纯 C，不依赖核心库） ——
 # 用于手动打开/关闭指定 CAN 通道并配置波特率（需要 sudo 运行）
 add_executable(kcanctl tools/kcanctl.c)

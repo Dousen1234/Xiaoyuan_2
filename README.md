@@ -489,6 +489,7 @@ cmake --build build
 | `taihu_keyboardctl_ui` | 示例 | `taihu_keyboardctl` 的 **Qt5 图形界面版**（按住按钮转动、自动刷新电机状态、急停；需 qtbase5-dev，未装自动跳过） |
 | `taihu_motor_tools` | 工具 | **工具总入口（菜单式）**：数字键选总线 + 数字键选工具（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值） |
 | `taihu_mpt_encoder` | 工具 | **MPT 磁编码器调试**（自动探测/设零位/改地址，RS485 总线，独立于 CAN） |
+| `taihu_encoder_can_bridge` | 工具 | **MPT 编码器→CAN 网关**（RS485 读数转 CAN 帧发到电机总线，共总线零冲突） |
 | `kcanctl` | 工具 | 鲲弘 CAN 通道控制（打开/关闭通道、配置波特率，需 sudo） |
 
 ---
@@ -555,6 +556,7 @@ TaiHu_motor_control/
 │   ├── taihu_motor_tools.cpp    #   工具总入口（菜单式，选总线+选工具）
 │   ├── taihu_torque_sensor.cpp  #   扭矩传感器独立查看工具
 │   ├── taihu_mpt_encoder.cpp    #   MPT 磁编码器独立调试工具（设零位/改地址）
+│   ├── taihu_encoder_can_bridge.cpp  #   MPT 编码器→CAN 软件网关
 │   ├── kcanctl.c                #   鲲弘 CAN 通道控制（打开/关闭/波特率）
 │   └── plot_motor_log.py        #   日志绘图脚本（Python + matplotlib）
 ├── deploy/                      # 可选的 udev 自动配置规则（默认不启用）
@@ -1153,6 +1155,30 @@ R 款两台**不能**共总线（无地址概念），需要两条独立总线/�
 ```
 
 单键操作：`z` 设零位 / `d` 改地址（D 款）/ `w` 开关 CSV 日志（`record/encoder_log.csv`）/ `q` 退出。实时显示角度、原始值、状态位、错误/警告、采样率。
+
+### 把编码器接入 CAN 总线（taihu_encoder_can_bridge 网关）
+
+MPT 全系列没有 CAN 输出型号（接口只有 SSI/BiSS-C/RS485/RS422/BUS），且 R 款一条 RS485 总线只能挂 1 台。**软件网关**把编码器读数“翻译”成 CAN 帧发到电机总线，总线上任何程序都能像读电机一样读到关节绝对角度：
+
+```
+MPT 编码器 ─RS485(2.5M)─ FT232H USB转485 ─┐
+                                            ├─ 同一台 Linux 主机
+电机/扭矩传感器 ─CAN─ 鲲弘 canX ───────────┘
+```
+
+```bash
+./build/taihu_encoder_can_bridge /dev/ttyUSB0 can0           # 默认 200Hz
+./build/taihu_encoder_can_bridge /dev/ttyUSB0 can0 100       # 100Hz
+```
+
+**CAN 帧协议**（标准帧，与电机/扭矩传感器共总线互不干扰，帧 ID 甄别）：
+
+| 帧 ID | 方向 | 长度 | 格式 |
+|---|---|---|---|
+| `0x20`（可参数化） | 网关→总线 | 8 | `[0]`=状态 S（b7 错误/b6 警告）；`[1..3]`=24 位原始值大端；`[4..7]`=角度 0.001° int32 大端 |
+| `0x21`（可参数化） | 总线→网关 | ≥1 | `[0]=0x01` 触发设零位（`cansend can0 021#01`） |
+
+监听验证：`candump can0,020:7FF`（转动编码器看 `0x20` 帧变化）；第二台编码器再跑一个网关实例，用不同帧 ID（`... can0 200 0x28 0x29`）。网关也可订阅 `0x21` 命令帧远程设零位。与 `taihu_mpt_encoder` 查看工具不要同时读同一台编码器（两个主会重复发 0x31/0x64 争抢应答）。
 
 ### ROS2 集成（独立节点）
 
