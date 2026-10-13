@@ -193,9 +193,10 @@ static uint8_t makeBusRequest(uint8_t op_type, uint8_t addr) {
 }
 
 // —— BUS 款“获取信息”返回（24 位单圈）长度：1（回显请求）+ 1（S）+ 3（A0A1A2）+ 1（CRC）= 6
-// —— RS485 款 0x31（24）返回：A2 A1 A0 S? … 按手册表格为 5 字节（A2 A1 A0 S CRC）
-//    实际上手册 24 位、0x31 行：N=5，字节为 A2 A1 A0 S CRC
-//    （0x31 无状态字节；0x64 N=5 为 A2 A1 A0 S CRC —— 同长但含 S；为稳妥两种都按 5 字节解析）
+// —— RS485 款返回长度（手册指令表，24 位单圈 / 24M 多圈）：
+//      0x31：24 → N=4（A2 A1 A0 CRC，无状态）；24M/24BM/24FM → N=6（M1 M0 A2 A1 A0 CRC）
+//      0x64：24 → N=5（A2 A1 A0 S CRC，含状态）；24M → N=7（M1 M0 A2 A1 A0 S CRC）
+//    R 款读取统一用 0x64（带状态字节，便于监控 error/warning）。
 
 MptEncoder::Protocol MptEncoder::probe(Rs485Port& port, uint8_t* found_addr, Output out, int tries) {
     // 1) 先试 BUS：全 0x1F 地址“获取信息”，期待 6 字节且 CRC 通过
@@ -221,12 +222,12 @@ MptEncoder::Protocol MptEncoder::probe(Rs485Port& port, uint8_t* found_addr, Out
             }
         }
     }
-    // 2) 再试 RS485：发 0x31，期待 5 字节且 CRC 通过
+    // 2) 再试 RS485：发 0x31，24 位单圈 N=4（A2 A1 A0 CRC）
     for (int i = 0; i < tries; ++i) {
         uint8_t reply[16] = {0};
         if (port.drain(), port.writeByte(0x31), true) {
-            int n = port.readBytes(reply, 5, 20);
-            if (n >= 5 && crc8(reply, 4) == reply[4]) {
+            int n = port.readBytes(reply, 4, 20);
+            if (n >= 4 && crc8(reply, 3) == reply[3]) {
                 if (found_addr) *found_addr = 0;
                 return Protocol::RS485;
             }
@@ -251,7 +252,9 @@ bool MptEncoder::readPosition(Sample& s) {
         s.error    = (reply[1] & 0x80) != 0;
         s.warning  = (reply[1] & 0x40) != 0;
     } else {
-        n = transact(0x31, reply, 5);
+        // R 款：0x64 获取位置+状态（24 位单圈 N=5：A2 A1 A0 S CRC）
+        // （0x31 不带状态字节，这里用 0x64 顺便拿到 error/warning）
+        n = transact(0x64, reply, 5);
         if (n < 5) return false;
         if (crc8(reply, 4) != reply[4]) return false;
         s.raw = (static_cast<uint32_t>(reply[0]) << 16) |
@@ -267,20 +270,8 @@ bool MptEncoder::readPosition(Sample& s) {
 }
 
 bool MptEncoder::readPositionStatus(Sample& s) {
-    if (proto_ == Protocol::BUS) return readPosition(s);  // BUS“获取信息”已含状态
-    uint8_t reply[16] = {0};
-    int n = transact(0x64, reply, 5);
-    if (n < 5) return false;
-    if (crc8(reply, 4) != reply[4]) return false;
-    s.raw = (static_cast<uint32_t>(reply[0]) << 16) |
-            (static_cast<uint32_t>(reply[1]) << 8) |
-            static_cast<uint32_t>(reply[2]);
-    s.status   = reply[3];
-    s.error    = (reply[3] & 0x80) != 0;
-    s.warning  = (reply[3] & 0x40) != 0;
-    s.angle_deg = rawToDeg(s.raw);
-    s.stamp = std::chrono::steady_clock::now();
-    return true;
+    // R 款 0x64 与 BUS “获取信息”均含状态字节，readPosition 已覆盖
+    return readPosition(s);
 }
 
 bool MptEncoder::setZero() {
@@ -290,8 +281,8 @@ bool MptEncoder::setZero() {
     uint8_t reply[16] = {0};
     if (proto_ == Protocol::RS485) {
         for (int i = 0; i < kRounds; ++i) {
-            int n = transact(0x31, reply, 5);
-            if (n < 5) continue;
+            int n = transact(0x31, reply, 4);   // 24 位单圈：A2 A1 A0 CRC
+            if (n < 4) continue;
             n = transact(0x30, reply, 2);
             if (n >= 2) {
                 // 返回 2 字节：C CRC（24 位单圈）
