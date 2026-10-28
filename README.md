@@ -535,14 +535,21 @@ TaiHu_motor_control/
 │   ├── can_interface.h          #   CAN 抽象接口 CanInterface / CanFrame
 │   ├── socket_can.h             #   SocketCAN 驱动（鲲弘 KH-UCANFDX6-Mini，can0~can5）
 │   ├── joint_module.h           #   关节模组控制类 JointModule
+│   ├── torque_sensor.h          #   坤维 HIT 扭矩传感器
+│   ├── mpt_encoder.h            #   金钢 MPT RS485/BUS 编码器
 │   ├── motor_logger.h           #   日志记录器 MotorLogger（CSV）
 │   ├── config.h                 #   全局配置（控制周期/采样周期等）
 │   └── taihu_tools.h            #   工具函数封装（诊断/标零/旋转等）
 ├── src/                         # 核心库实现
 │   ├── socket_can.cpp
 │   ├── joint_module.cpp
+│   ├── torque_sensor.cpp
+│   ├── mpt_encoder.cpp
 │   ├── motor_logger.cpp
 │   └── taihu_tools.cpp
+├── docs/
+│   ├── api.md                   # 核心 C++ / ROS 2 API 参考
+│   └── manuals/                 # 厂家协议手册
 ├── examples/                    # 示例程序
 │   ├── taihu_singleleg_step.cpp #   单腿步态（四电机，五次多项式轨迹）
 │   ├── taihu_singleleg_step_xCAN.cpp # 多总线单腿步态同步控制（每总线一条腿）
@@ -571,6 +578,7 @@ TaiHu_motor_control/
 ```
 
 核心实现编译为静态库 `taihu_core`，示例与工具统一链接。
+供其他 C++ 项目复用的完整接口索引见 [API 参考](docs/api.md)。
 
 ---
 

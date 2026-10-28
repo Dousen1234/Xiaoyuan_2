@@ -56,7 +56,7 @@ constexpr int32_t kPositionKd = 60;
 
 /// 单个阶段时长 (s)。三个阶段（0/1/2）时长完全相同，只改这一个变量即可整体缩放步态快慢。
 /// 修改后绘图时须给 tools/plot_motor_log.py 传 --phase-sec 保持一致（步数 N 用 --num-steps）。
-constexpr double kPhaseSec = 5.0;
+constexpr double kPhaseSec = 3.0;
 
 /// 一步包含的阶段数（阶段 0 零位保持 / 阶段 1 正摆 / 阶段 2 回摆）。
 constexpr int kPhasesPerStep = 3;

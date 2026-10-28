@@ -26,3 +26,6 @@ Makefile
 *.o
 *.a
 __pycache__/
+
+# 厂家调试资料压缩包（体积过大，不入库）
+/MPT调试资料.zip
