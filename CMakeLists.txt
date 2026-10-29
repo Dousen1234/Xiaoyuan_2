@@ -35,6 +35,9 @@ taihu_add_executable(taihu_single_motorctl examples/taihu_single_motorctl.cpp)
 taihu_add_executable(taihu_single_motorctl_xCAN examples/taihu_single_motorctl_xCAN.cpp)
 taihu_add_executable(taihu_keyboardctl examples/taihu_keyboardctl.cpp)
 
+# 四腿机器人关节级命令控制（语义命令 → 限位 → 平滑轨迹 → 到位确认）
+taihu_add_executable(walk_control_V1 examples/walk_control_V1.cpp)
+
 # —— 工具程序 ——
 # taihu_motor_tools：菜单式工具总入口（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值）
 taihu_add_executable(taihu_motor_tools tools/taihu_motor_tools.cpp)

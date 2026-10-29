@@ -485,6 +485,7 @@ cmake --build build
 | `taihu_singleleg_step_xCAN` | 示例 | 多 CAN 总线单腿步态同步控制（运行时输入步数 N 与总线数，每总线一条腿） |
 | `taihu_single_motorctl` | 示例 | 单电机交互式控制（位置/正弦） |
 | `taihu_single_motorctl_xCAN` | 示例 | 多 CAN 总线电机同步控制（每总线一线程，时序对齐） |
+| `walk_control_V1` | 示例 | **四腿机器人关节级命令控制**（`move 1 J1 cw 90` 式语义命令 → 限位 → 平滑轨迹 → 到位确认，腿 i ↔ can{i-1}，YPPY 构型） |
 | `taihu_keyboardctl` | 示例 | **键盘交互式控制单腿四电机**（↑↓ 按住转动松手即停，Ctrl+V/1~4/P 切换与查询） |
 | `taihu_keyboardctl_ui` | 示例 | `taihu_keyboardctl` 的 **Qt5 图形界面版**（按住按钮转动、自动刷新电机状态、急停；需 qtbase5-dev，未装自动跳过） |
 | `taihu_motor_tools` | 工具 | **工具总入口（菜单式）**：数字键选总线 + 数字键选工具（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值） |
@@ -555,6 +556,7 @@ TaiHu_motor_control/
 │   ├── taihu_singleleg_step_xCAN.cpp # 多总线单腿步态同步控制（每总线一条腿）
 │   ├── taihu_single_motorctl.cpp #  单电机交互式控制（位置/正弦）
 │   ├── taihu_single_motorctl_xCAN.cpp # 多总线电机同步控制（每总线一线程）
+│   ├── walk_control_V1.cpp     #   四腿机器人关节级命令控制（语义命令/限位/平滑轨迹/到位确认）
 │   └── taihu_keyboardctl.cpp    #   键盘交互式控制单腿四电机（按住转动松手即停）
 ├── ui/                          # Qt5 图形界面程序
 │   └── taihu_keyboardctl_ui.cpp #   键盘控制 demo 的 GUI 版（worker 线程独占 CAN）
@@ -850,6 +852,31 @@ sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 - 控制模式与 `taihu_single_motorctl` 相同：1 位置控制（五次多项式轨迹，所有电机相同目标角度与时长）／2 正弦轨迹测试。
 
 典型场景：can0、can1 各接一台电机，两电机严格同步转动同一角度。
+
+### `walk_control_V1`（四腿机器人关节级命令控制）★
+
+```bash
+./build/walk_control_V1
+```
+
+面向腿臂机器人遥操作：输入**关节级语义命令**（腿号 + 关节 + 方向 + 角度），程序自动完成 读当前角 → 软件限位 → 五次多项式平滑轨迹 → 5ms 周期下发 → 到位确认，对应"腿1的J1顺时针转90°"这类上位机指令。
+
+- **构型**：4 腿 × 4 关节 YPPY，腿 i ↔ `can{i-1}`；J1/J4 = Y 直驱（101），J2/J3 = P 锥齿轮 1:2（关节端总减速比 162）；
+- **单位**：角度一律按**关节端**计算（P 关节换算在 demo 层完成，`JointModule` 仍用电机输出端 API）；
+- **符号**：ccw（逆时针）= 正角度，与 `taihu_singleleg_step_xCAN` 的电机正方向一致；个别关节若因锥齿轮装反方向相反，改 [`kJointDirSign`](examples/walk_control_V1.cpp:105) 对应元素为 -1 即可；
+- **软件限位**（关节端）：J1 ±90°、J2 ±120°、J3 -30°~+180°、J4 ±90°，越界命令直接拒绝；
+- **命令一览**（启动后输入，`help` 随时查看）：
+
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `move <腿> <关节> <cw\|ccw> <角度°> [时长s]` | 相对转动 | `move 1 J1 cw 90` |
+| `goto <腿> <关节> <角度°> [时长s]` | 转到绝对关节角 | `goto 1 J2 45` |
+| `pos [腿]` | 查询关节角（缺省全部腿） | `pos 1` |
+| `estop` | 急停：全部电机立即抱闸 | |
+| `quit` | 退出（抱闸后退出） | |
+
+- **线程模型**：主线程只做命令解析，所有 CAN 收发串行集中在执行线程（急停延迟 ≤5ms（轨迹中）/ ≤50ms（空闲）），避免多线程并发共享总线；
+- 运动期间其它关节持续重发当前位置保持（不塌腿）；到位后不抱闸、由电机位置环保持；`estop`/`quit` 才抱闸。
 
 ### `taihu_keyboardctl`（键盘交互式控制单腿四电机）
 
