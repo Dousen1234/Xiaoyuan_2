@@ -35,6 +35,9 @@ taihu_add_executable(taihu_single_motorctl examples/taihu_single_motorctl.cpp)
 taihu_add_executable(taihu_single_motorctl_xCAN examples/taihu_single_motorctl_xCAN.cpp)
 taihu_add_executable(taihu_keyboardctl examples/taihu_keyboardctl.cpp)
 
+# 单腿 4 关节纯 PD 位置模式 demo（200Hz，hold/goto 交互命令 + 软限位/电流/急停保护）
+taihu_add_executable(taihu_pd_leg examples/taihu_pd_leg.cpp)
+
 # 四腿机器人关节级命令控制（语义命令 → 限位 → 平滑轨迹 → 到位确认）
 taihu_add_executable(walk_control_V1 examples/walk_control_V1.cpp)
 
