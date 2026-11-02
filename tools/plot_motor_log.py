@@ -12,7 +12,7 @@
   - 位置图：叠加各电机的目标位置曲线（与实测同色的虚线）做对照。目标轨迹支持两种步态模型：
       singleleg：复现 examples/taihu_singleleg_step.cpp 的 6 阶段单腿步态（每阶段 10 s）；
       xcan     ：复现 examples/taihu_singleleg_step_xCAN.cpp 的一步 3 阶段步态
-                 （零位保持 / ID2,3 0→+180° / ID2,3 +180°→0，每阶段 5 s，重复 N 步）；
+                 （零位保持 / ID2,3 0→+180° / ID2,3 +180°→0，每阶段 1 s，重复 N 步）；
   - 步态模型默认自动识别：文件名含 "_can"（如 motor_log_can0.csv）用 xcan，否则用 singleleg；
   - 电流图：额外绘制四个电机瞬时电流之和的曲线。
 
@@ -80,7 +80,10 @@ SINGLELEG_PHASES = [
 
 # 模型 2：xcan（复现自 examples/taihu_singleleg_step_xCAN.cpp）
 # 一步 = 3 个等长阶段：零位保持 / ID2,3 0→+180° / ID2,3 +180°→0；多步循环复用，重复 N 次
-XCAN_PHASE_SEC = 5.0                            # 每个阶段时长 (s)，须与 cpp 中 kPhaseSec 一致
+XCAN_PHASE_SEC = 1.0                            # 每个阶段时长 (s)，须与 cpp 中 kPhaseSec 一致
+                                                # 注意：cpp 默认「到位即切换」模式下实际阶段时长
+                                                # = max(kPhaseSec, 到位所需时间)，必要时用
+                                                # --phase-sec 或 --total-sec 按实际运行覆盖
 XCAN_STEP_PHASES = [
     [(0.0,   0.0,   0.0, 0.0),                  # 阶段 0：四电机零位保持不动
      (0.0,   0.0,   0.0, 0.0)],
@@ -148,7 +151,7 @@ def main() -> int:
     parser.add_argument("--gait", choices=["auto", "singleleg", "xcan"], default="auto",
                         help="目标轨迹步态模型（默认 auto：文件名含 _can 用 xcan，否则 singleleg）")
     parser.add_argument("--phase-sec", type=float, default=None,
-                        help="每个阶段时长 (s)；默认 singleleg=10.0、xcan=5.0，须与 cpp 中 kStepSec/kPhaseSec 一致")
+                        help="每个阶段时长 (s)；默认 singleleg=10.0、xcan=1.0，须与 cpp 中 kStepSec/kPhaseSec 一致")
     parser.add_argument("--num-steps", type=int, default=1,
                         help="xcan 步态的步数 N（默认 1，须与运行时输入一致）")
     parser.add_argument("--total-sec", type=float, default=None,
