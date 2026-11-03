@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # =====================================================================
-# TaiHu_motor_control —— kcan 驱动安装 / 卸载 / 开机自加载
+# TaiHu_motor_control —— 鲲弘（Kunhong）USB-CAN 驱动一键安装 / 卸载 / 自加载
 #
-# 本脚本【只】管 kcan 驱动的安装与维护，不编译项目、不装编译器。
-# 环境准备（gcc/cmake/can-utils 等）请用 deploy/install_env.sh。
+# 本脚本负责把 KH-UCANFD 系列 USB-CAN 模块在本机跑起来，共三步：
+#   拿到 kcan.ko  →  校验  →  安装并加载
+#
+# 脚本【自动判断】用哪条路线拿到 kcan.ko（见 --route）：
+#   compile  板上本机编译（需内核头文件 /lib/modules/$(uname -r)/build）
+#   sdk      用厂商 SDK 源码编译（自动 make，只编不装，产物再走校验流程）
+#   prebuilt 直接用现成的 aarch64 kcan.ko（厂商提供或交叉编译产物）
 #
 # 为什么单独拆一个脚本：
 #   - 驱动是可反复重装的（换内核、换设备、回滚），单独跑更快
@@ -11,8 +16,8 @@
 #   - 支持卸载 / 回滚，install_env.sh 不适合承担这种破坏性操作
 #
 # 脚本做的事（10 个阶段，全部幂等，可反复执行）：
-#   步骤 1  环境检查（root / aarch64 / 内核版本 / 工具链）
-#   步骤 2  定位 kcan.ko（多路径搜索 + 架构过滤）
+#   步骤 1  环境检查（root / aarch64 / 内核版本 / 工具链 / 编译可行性）
+#   步骤 2  获取 kcan.ko（搜索预编译件 → 必要时自动编译 SDK 源码）
 #   步骤 3  严格校验 .ko（架构 / vermagic / 签名 / 依赖符号）
 #   步骤 4  安装 .ko 到 /lib/modules/$(uname -r)/misc/
 #   步骤 5  写入 modprobe 配置 /etc/modprobe.d/kcan.conf
@@ -23,8 +28,9 @@
 #   步骤 10 汇总与后续提示
 #
 # 用法：
-#   sudo ./deploy/install_kcan.sh                     # 全流程（推荐）
+#   sudo ./deploy/install_kcan.sh                     # 全流程（推荐，自动选路线）
 #   sudo ./deploy/install_kcan.sh --check             # 只检查，不改系统
+#   sudo ./deploy/install_kcan.sh --route compile     # 强制板机编译
 #   sudo ./deploy/install_kcan.sh --ko /path/kcan.ko  # 指定驱动文件
 #   sudo ./deploy/install_kcan.sh --reload            # 重装并热重载模块
 #   sudo ./deploy/install_kcan.sh --uninstall         # 完整卸载
@@ -34,8 +40,9 @@
 #   * 本脚本【绝不】自动 up CAN 通道。通道必须按现场接线手动打开：
 #         sudo ./build/kcanctl up can4 1000000
 #     （接口编号随 USB 插入顺序变化，先用 ./build/kcanctl list 确认）
-#   * 本脚本【不】编译内核模块。kcan.ko 必须是厂商为
-#     本机内核版本 + aarch64 提供的预编译件。
+#   * 编译 SDK 时【绝不】传 -rules / -dkms-rules。那两个参数会写入
+#     NAME="kcan%n"，把 can0 改名成 kcan0，直接破坏本项目所有硬编码 "can0"
+#     的程序。本脚本用 make 直接编译，只产出 kcan.ko，不碰 udev。
 #   * --reload / --uninstall 会先 down 掉所有 canN 接口（rmmod 的前置条件），
 #     若此时有程序在用总线，请先停掉。
 # =====================================================================
@@ -68,8 +75,23 @@ readonly VENDOR_HEADERS=(kcan.h kcanfd.h)
 DRIVER_SEARCH_PATHS=(
     "${SCRIPT_DIR}/kcan-driver"              # 推荐：随仓库分发
     "${PROJECT_ROOT}/kcan-driver"
-    "${PROJECT_ROOT}/.kunhong_sdk"           # 厂商 SDK（通常是 x86-64，仅作发现）
+    "${PROJECT_ROOT}/.kunhong_sdk"           # 厂商 SDK（编出来的 .ko 也在这里）
 )
+
+# 厂商 SDK（源码发行，需自己编译）
+#   搜索顺序：仓库内 .kunhong_sdk → 仓库根同名目录 → 用户 HOME 下同名目录
+SDK_SEARCH_PATHS=(
+    "${PROJECT_ROOT}/.kunhong_sdk"
+    "${PROJECT_ROOT}"
+    "${HOME:-/root}/.kunhong_sdk"
+)
+
+# 编译产物落点：编好的 kcan.ko 拷到这里，走与预编译件完全相同的校验流程
+readonly BUILD_OUTPUT_DIR="${SCRIPT_DIR}/kcan-driver"
+readonly BUILD_OUTPUT_KO="${BUILD_OUTPUT_DIR}/kcan.ko"
+
+# 内核构建树（板机编译的前提）
+readonly KHDR_DIR="/lib/modules/${KREL}/build"
 
 # 颜色（非 tty 或 NO_COLOR 时自动关闭）
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -98,6 +120,17 @@ OPT_NO_HEADERS=0
 OPT_WITH_UDEV=0
 OPT_NO_LOAD=0
 OPT_KO_PATH=""
+OPT_ROUTE="auto"          # auto | compile | sdk | prebuilt | skip
+OPT_KERNEL_LOCATION=""    # 交叉编译 / 非标准内核源码树路径
+OPT_SDK_PATH=""           # 显式指定的 SDK 根目录（--sdk）
+OPT_JOBS=""               # 编译并行度（默认 nproc）
+
+# 运行时状态
+SDK_ROOT=""               # 定位到的厂商 SDK 根目录
+HAVE_KHDR=0               # 是否有可用的内核构建树
+BUILT_KO=""               # 本次编译产出的 kcan.ko 路径
+COMPILE_ATTEMPTED=0       # 是否尝试过编译
+KERNEL_PREPARED=0         # 内核树是否已 prepared（有 Module.symvers/.config）
 
 # ---------------------------------------------------------------------
 # 输出辅助
@@ -107,6 +140,9 @@ log_ok()   { printf '%s[完成]%s %s\n' "${C_GREEN}"  "${C_RESET}" "$*"; N_OK+=1
 log_warn() { printf '%s[警告]%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; N_WARN+=1; }
 log_fail() { printf '%s[失败]%s %s\n' "${C_RED}"    "${C_RESET}" "$*" >&2; N_FAIL+=1; }
 log_skip() { printf '%s[跳过]%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*"; N_SKIP+=1; }
+
+# 提示行：缩进输出，不参与统计（用于补充说明）
+log_hint() { printf '       %s\n' "$*"; }
 
 section() {
     printf '\n%s=====================================================================%s\n' "${C_BOLD}" "${C_RESET}"
@@ -181,6 +217,214 @@ module_loaded() {
     [[ -d "/sys/module/kcan" ]]
 }
 
+# ---------------------------------------------------------------------
+# 编译相关辅助
+# ---------------------------------------------------------------------
+
+# 实际要用的内核构建树：--kernel-location 优先，否则 /lib/modules/$(uname -r)/build
+kernel_build_dir() {
+    if [[ -n "${OPT_KERNEL_LOCATION}" ]]; then
+        printf '%s' "${OPT_KERNEL_LOCATION}"
+    else
+        printf '%s' "${KHDR_DIR}"
+    fi
+}
+
+# 内核构建树是否可用（Kbuild 需要 Makefile + include/ + scripts|arch）
+has_kernel_headers() {
+    local d
+    d="$(kernel_build_dir)"
+    [[ -d "${d}" ]] || return 1
+    local r
+    r="$(readlink -f "${d}" 2>/dev/null || printf '%s' "${d}")"
+    [[ -f "${r}/Makefile" ]] || return 1
+    [[ -d "${r}/include" ]] || return 1
+    [[ -d "${r}/scripts" || -d "${r}/arch" ]] || return 1
+    return 0
+}
+
+# 内核树是否已经 prepared（编译外部模块必须）
+#   判定依据：有 .config 且有 scripts/ 下的 build 支撑文件
+#   没 prepared 时 make 会报 "run 'make oldconfig && make prepare'"
+kernel_tree_prepared() {
+    local d
+    d="$(readlink -f "$(kernel_build_dir)" 2>/dev/null || kernel_build_dir)"
+    [[ -f "${d}/.config" ]] || return 1
+    # Module.symvers 缺失时 5.x 仍可编译（会警告），但 .config 必须有
+    [[ -f "${d}/include/config/auto.conf" || -f "${d}/include/generated/autoconf.h" ]]
+}
+
+# 定位厂商 SDK 根目录（要求含 driver/Makefile + driver/src）
+find_sdk_root() {
+    local p cand
+    # 1) 用户显式指定优先，但必须真的是可用的 SDK 目录
+    if [[ -n "${OPT_SDK_PATH}" ]]; then
+        for cand in "${OPT_SDK_PATH}" "${OPT_SDK_PATH}"/KH-UCANFD_Linux_SDK-*; do
+            [[ -d "${cand}" ]] || continue
+            if [[ -f "${cand}/driver/Makefile" && -d "${cand}/driver/src" ]]; then
+                ( cd "${cand}" && pwd )
+                return 0
+            fi
+        done
+        # 指定了却不可用，明确告知（不静默回退）
+        return 2
+    fi
+    # 2) 自动搜索
+    for p in "${SDK_SEARCH_PATHS[@]}"; do
+        [[ -d "${p}" ]] || continue
+        # SDK 可能被解压成 KH-UCANFD_Linux_SDK-x.y.z 子目录
+        for cand in "${p}" "${p}"/KH-UCANFD_Linux_SDK-*; do
+            [[ -d "${cand}" ]] || continue
+            if [[ -f "${cand}/driver/Makefile" && -d "${cand}/driver/src" ]]; then
+                ( cd "${cand}" && pwd )
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# 编译所需的 gcc 是否存在
+compiler_available() {
+    command -v make >/dev/null 2>&1 || return 1
+    command -v gcc  >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# 从 SDK 源码编译出 kcan.ko（只编译，不安装、不碰 udev）
+#   用 make 直接编，绕开 build.sh 的 install 动作，避免误写 udev 改名规则
+build_from_sdk() {
+    COMPILE_ATTEMPTED=1
+
+    log_info "SDK 目录     : ${SDK_ROOT:-未找到}"
+
+    if [[ -z "${SDK_ROOT}" ]]; then
+        log_fail "没找到厂商 SDK 源码目录"
+        log_hint "SDK 是纯源码发行（不含 aarch64 预编译件），需要先拿到源码："
+        log_hint "  git clone https://gitee.com/ChengDu-KunHong/KH-UCANFD_Linux_SDK.git \\"
+        log_hint "      ${PROJECT_ROOT}/.kunhong_sdk"
+        log_hint "或从 Release 下载 zip 解压到 ${PROJECT_ROOT}/.kunhong_sdk/"
+        return 1
+    fi
+
+    if ! compiler_available; then
+        log_fail "编译工具链不全（需要 make 与 gcc）"
+        log_hint "Ubuntu 上执行: sudo apt-get install -y build-essential"
+        log_hint "离线环境请准备 build-essential 及其依赖的 .deb"
+        return 1
+    fi
+
+    # SDK 自带的 .o 是 x86-64 编出来的，混进来会链接错架构
+    log_info "清理旧产物 : make clean（SDK 自带的 .o 是 x86-64，必须清掉）"
+    if (( OPT_DRY_RUN )); then
+        log_info "[试运行] (cd ${SDK_ROOT}/driver && make clean)"
+    else
+        ( cd "${SDK_ROOT}/driver" && make clean >/dev/null 2>&1 ) || true
+    fi
+
+    local -a kargs=( "KERNEL_LOCATION=${KHDR_DIR}" )
+    if [[ -n "${OPT_KERNEL_LOCATION}" ]]; then
+        kargs=( "KERNEL_LOCATION=${OPT_KERNEL_LOCATION}" )
+        log_info "内核源码树   : ${OPT_KERNEL_LOCATION}（--kernel-location 指定）"
+    else
+        log_info "内核源码树   : ${KHDR_DIR}"
+    fi
+    if [[ -n "${OPT_JOBS}" ]]; then
+        kargs+=( "-j${OPT_JOBS}" )
+    fi
+
+    log_info "编译命令     : make ${kargs[*]}"
+    log_warn "只编译不安装：本步骤不执行 make install，也不碰 udev"
+    log_info "             （build.sh -rules 会写入 NAME=\"kcan%n\" 把 can0 改名）"
+
+    if (( OPT_CHECK_ONLY )); then
+        log_hint "--check 模式：未实际编译"
+        return 1
+    fi
+
+    if (( OPT_DRY_RUN )); then
+        log_info "[试运行] (cd ${SDK_ROOT}/driver && make ${kargs[*]})"
+        return 1
+    fi
+
+    local rc=0
+    ( cd "${SDK_ROOT}/driver" && make "${kargs[@]}" ) || rc=$?
+
+    if (( rc != 0 )); then
+        log_fail "编译失败（make 返回 ${rc}）"
+        log_hint "常见原因："
+        log_hint "  · 内核树未 prepared"
+        log_hint "    → cd ${KHDR_DIR} && sudo make oldconfig && sudo make prepare"
+        log_hint "  · gcc 版本与编译内核时用的版本不一致"
+        log_hint "    → grep -a 'Linux version' /proc/version  看内核用的 gcc"
+        log_hint "    → sudo make CC=gcc-12 ${kargs[*]}"
+        log_hint "  · 内核源码树不完整（缺 include/generated）"
+        log_hint "  → 详见 ${SDK_ROOT}/release_notes.txt"
+        return 1
+    fi
+
+    local produced="${SDK_ROOT}/driver/kcan.ko"
+    if [[ ! -f "${produced}" ]]; then
+        log_fail "make 成功但没找到产物 ${produced}"
+        return 1
+    fi
+
+    log_ok "编译成功: ${produced}"
+
+    # 拷到统一落点，后续步骤按同一路径处理
+    run mkdir -p "${BUILD_OUTPUT_DIR}"
+    run cp -f "${produced}" "${BUILD_OUTPUT_KO}"
+    BUILT_KO="${BUILD_OUTPUT_KO}"
+    log_ok "已复制到   : ${BUILD_OUTPUT_KO}"
+    return 0
+}
+
+# 汇总当前能否编译
+report_compile_feasibility() {
+    HAVE_KHDR=0
+    local kdir; kdir="$(kernel_build_dir)"
+    if has_kernel_headers; then
+        HAVE_KHDR=1
+        if [[ -n "${OPT_KERNEL_LOCATION}" ]]; then
+            log_ok "内核构建树   : ${kdir}（--kernel-location 指定）"
+        else
+            log_ok "内核构建树   : ${kdir}"
+        fi
+        if kernel_tree_prepared; then
+            KERNEL_PREPARED=1
+            log_ok "内核树状态   : 已 prepared（可直接编译）"
+        else
+            KERNEL_PREPARED=0
+            log_warn "内核树状态   : 存在但未 prepared"
+            log_hint "             编译前需要: cd ${kdir} && sudo make oldconfig && sudo make prepare"
+        fi
+    else
+        log_warn "内核构建树   : 缺失 ${kdir}"
+        log_hint "             没有它无法在板上编译 kcan.ko"
+    fi
+
+    local sdk_rc=0
+    SDK_ROOT="$(find_sdk_root)" || sdk_rc=$?
+    if (( sdk_rc == 0 )); then
+        if [[ -n "${OPT_SDK_PATH}" ]]; then
+            log_ok "厂商 SDK     : ${SDK_ROOT}（--sdk 指定）"
+        else
+            log_ok "厂商 SDK     : ${SDK_ROOT}"
+        fi
+    elif (( sdk_rc == 2 )); then
+        # 用户显式指定了 SDK 路径，但该路径里没有可用的源码树
+        SDK_ROOT=""
+        log_fail "厂商 SDK     : --sdk 指定的路径不可用"
+        log_hint "             ${OPT_SDK_PATH}"
+        log_hint "             该目录下需存在 driver/Makefile 与 driver/src/"
+    else
+        SDK_ROOT=""
+        log_info "厂商 SDK     : 未找到（不影响使用预编译 .ko）"
+        log_hint "             需要源码编译时，把 KH-UCANFD_Linux_SDK-* 解压到 .kunhong_sdk/"
+        log_hint "             或用 --sdk <路径> 指定"
+    fi
+}
+
 # 当前所有 canN 接口名
 list_can_ifaces() {
     if command -v ip >/dev/null 2>&1; then
@@ -194,13 +438,26 @@ list_can_ifaces() {
 # =====================================================================
 usage() {
     cat <<'EOF'
-TaiHu_motor_control —— kcan 驱动安装 / 卸载 / 开机自加载
+TaiHu_motor_control —— 鲲弘（Kunhong）USB-CAN 驱动一键安装 / 卸载 / 自加载
 
 用法:
   sudo ./deploy/install_kcan.sh [选项]
 
+路线选择:
+  (不加 --route)    自动判断：有预编译件就用，没有就尝试编译 SDK 源码
+  --route auto      同上（显式写法）
+  --route compile   强制板机编译（必须已有内核头文件）
+  --route sdk       强制用厂商 SDK 源码编译
+  --route prebuilt  强制只用现成的 aarch64 kcan.ko，绝不编译
+  --route skip      跳过 kcan 驱动这一步
+
 选项:
   --ko <路径>      指定 kcan.ko（默认自动在 deploy/kcan-driver/ 等目录搜索）
+  --sdk <路径>     指定厂商 SDK 根目录（默认自动搜索 .kunhong_sdk）
+  --kernel-location <路径>
+                   指定内核源码树（默认 /lib/modules/$(uname -r)/build；
+                   交叉编译后拷到板上的内核树也用它指定）
+  -j <N>           编译并行度（默认 make 自己决定）
   --reload         安装后热重载模块（会先 down 所有 canN 接口）
   --uninstall      完整卸载：rmmod + 删除 .ko/配置/工具
   --no-autoload    不写 /etc/modules-load.d/kcan.conf（即不设开机自加载）
@@ -215,33 +472,44 @@ TaiHu_motor_control —— kcan 驱动安装 / 卸载 / 开机自加载
   -h, --help       显示本帮助
 
 典型场景:
-  # 1) 第一次装驱动
-  sudo ./deploy/install_kcan.sh --ko /path/to/aarch64/kcan.ko
+  # 1) 第一次装驱动（自动选路线，推荐）
+  sudo ./deploy/install_kcan.sh
 
   # 2) 只想知道现在缺什么（不改系统）
   ./deploy/install_kcan.sh --check
 
-  # 3) 换了新驱动文件，热重载
+  # 3) 板子上有内核头文件，强制本机编译
+  sudo ./deploy/install_kcan.sh --route compile
+
+  # 4) 用交叉编译产出的 .ko
+  sudo ./deploy/install_kcan.sh --ko /path/to/aarch64/kcan.ko
+
+  # 5) 换了新驱动文件，热重载
   sudo ./deploy/install_kcan.sh --ko ./deploy/kcan-driver/kcan.ko --reload
 
-  # 4) 内核升级后需要重装
+  # 6) 内核升级后需要重装
   sudo ./deploy/install_kcan.sh --reload
 
-  # 5) 彻底卸载
+  # 7) 彻底卸载
   sudo ./deploy/install_kcan.sh --uninstall
 
 驱动文件放哪里（脚本按顺序搜索，取第一个 aarch64 的）:
-      deploy/kcan-driver/kcan.ko                  ← 推荐
+      deploy/kcan-driver/kcan.ko                  ← 推荐（编译产物也落在这里）
       deploy/kcan-driver/driver/kcan.ko
       kcan-driver/kcan.ko
-      .kunhong_sdk/**/kcan.ko                     ← 注意：SDK 自带的是 x86-64，会被跳过
+      .kunhong_sdk/**/kcan.ko                     ← 注意：SDK 自带的是 x86-64，
+                                                    会被自动跳过
       .kunhong_sdk/KH-UCANFD_Linux_SDK-*/driver/kcan.ko
 
 ⚠ 关于内核版本：
-    kcan.ko 的 vermagic 必须与本机内核（当前 5.10.160）完全一致，
+    kcan.ko 的 vermagic 必须与本机内核（当前 $(uname -r)）完全一致，
     否则 modprobe 会报 "invalid module format"。
-    若本机是厂商定制内核（RK3588 Ubuntu 20.04 常见），apt 里没有匹配的
-    linux-headers，无法自行编译，必须向厂商索取对应版本的 aarch64 .ko。
+
+    若本机是厂商定制内核（RK3588 + Ubuntu 20.04 上的 5.10.x 很常见），
+    apt 源里没有匹配的 linux-headers 时，本脚本会自动尝试从 SDK 源码编译；
+    编译也会失败的话，两条路：
+      a) 在 x86 机器上交叉编译（SDK 支持，见 cross_compile_config.sh）
+      b) 向鲲弘索取对应内核版本的 aarch64 kcan.ko
 
 开 CAN 通道（本脚本不会自动执行）:
       ./build/kcanctl list
@@ -255,6 +523,19 @@ parse_args() {
             --ko)            [[ $# -ge 2 ]] || die "--ko 需要一个参数"
                              OPT_KO_PATH="$2"; shift ;;
             --ko=*)          OPT_KO_PATH="${1#*=}" ;;
+            --sdk)           [[ $# -ge 2 ]] || die "--sdk 需要一个参数"
+                             OPT_SDK_PATH="$2"; shift ;;
+            --sdk=*)         OPT_SDK_PATH="${1#*=}" ;;
+            --kernel-location)
+                             [[ $# -ge 2 ]] || die "--kernel-location 需要一个参数"
+                             OPT_KERNEL_LOCATION="$2"; shift ;;
+            --kernel-location=*)
+                             OPT_KERNEL_LOCATION="${1#*=}" ;;
+            --route)         [[ $# -ge 2 ]] || die "--route 需要一个参数"
+                             OPT_ROUTE="$2"; shift ;;
+            --route=*)       OPT_ROUTE="${1#*=}" ;;
+            -j)              [[ $# -ge 2 ]] || die "-j 需要一个参数"
+                             OPT_JOBS="$2"; shift ;;
             --reload)        OPT_RELOAD=1 ;;
             --uninstall)     OPT_UNINSTALL=1 ;;
             --no-autoload)   OPT_NO_AUTOLOAD=1 ;;
@@ -271,6 +552,12 @@ parse_args() {
         esac
         shift
     done
+
+    case "${OPT_ROUTE}" in
+        auto|compile|sdk|prebuilt|skip) ;;
+        *) die "--route 只能是 auto / compile / sdk / prebuilt / skip，收到: ${OPT_ROUTE}" ;;
+    esac
+    return 0
 }
 
 # =====================================================================
@@ -320,19 +607,16 @@ step1_env() {
         # Ubuntu 20.04 官方内核是 5.4.x；5.10.x 说明是厂商定制内核
         if [[ "${KREL}" == 5.10.* ]]; then
             log_warn "内核 5.10.x 非 Ubuntu 20.04 官方版本（官方为 5.4.x）"
-            log_info "             → 判定为厂商定制内核，apt 中没有匹配的 linux-headers，"
-            log_info "               必须使用厂商提供的 aarch64 kcan.ko，无法自行编译"
+            log_info "             → 判定为厂商定制内核（RK3588 常见）"
+            log_info "             → apt 源里通常没有匹配的 linux-headers"
+            log_info "             → 板上编译大概率不可行，见下方结论"
         fi
     elif [[ -n "${distro}" ]]; then
         log_info "发行版不是 Ubuntu 20.04，本脚本仍可运行，请留意路径差异"
     fi
 
-    # —— 1.5 内核头文件（仅影响「能否自行编译」，本脚本不编译） ——
-    if [[ -d "/lib/modules/${KREL}/build" ]]; then
-        log_info "内核头文件   : 存在（理论上可自行编译，但本脚本坚持用预编译 .ko）"
-    else
-        log_info "内核头文件   : 缺失 → 本脚本不编译，使用厂商预编译 .ko（这是预期路径）"
-    fi
+    # —— 1.5 编译可行性（决定走哪条路线） ——
+    report_compile_feasibility
 
     # —— 1.6 必需工具 ——
     local tool missing=()
@@ -448,41 +732,126 @@ step2_locate() {
         done
     fi
 
-    # —— 2.5 结论 ——
+    # —— 2.5 没找到现成的：按路线尝试编译 ——
     if [[ -n "${FOUND_KO}" ]]; then
         log_ok "找到可用的 aarch64 驱动: ${FOUND_KO}"
         return 0
     fi
 
-    log_fail "未找到任何 aarch64 版的 kcan.ko"
-    printf '\n' >&2
-    printf '%s  —— 你需要向厂商（成都昆虹电子 / Kunhong）索取以下文件 ——%s\n' "${C_BOLD}" "${C_RESET}" >&2
+    log_info "未找到现成的 aarch64 版 kcan.ko，尝试自行编译"
+    section "步骤 2b / 10  编译 kcan.ko"
+
+    if [[ "${OPT_ROUTE}" == "prebuilt" ]]; then
+        log_fail "按 --route prebuilt 指定只用预编译件，但没找到"
+        log_hint "请把 aarch64 的 kcan.ko 放到: ${BUILD_OUTPUT_DIR}/kcan.ko"
+        log_hint "或用 --ko 指定路径"
+        return 0
+    fi
+
+    if [[ "${OPT_ROUTE}" == "skip" ]]; then
+        log_skip "按 --route skip 跳过驱动获取"
+        return 0
+    fi
+
+    # 编译前提：内核头文件
+    if (( ! HAVE_KHDR )); then
+        local kdir; kdir="$(kernel_build_dir)"
+        if (( OPT_CHECK_ONLY )); then
+            log_warn "缺少内核构建树 ${kdir}，板上无法编译"
+        else
+            log_fail "无法编译：缺少内核构建树 ${kdir}"
+        fi
+        log_hint "编译内核模块必须有与当前内核完全对应的构建树"
+        log_hint ""
+        log_hint "当前内核 ${KREL} 是厂商定制内核时的两条出路："
+        log_hint "  ① 在 x86 机器上交叉编译（SDK 原生支持）："
+        log_hint "     编辑 SDK 的 cross_compile_config.sh，设置"
+        log_hint "       export ARCH=arm64"
+        log_hint "       export CROSS_COMPILE=/path/to/aarch64-linux-gnu-"
+        log_hint "       export KERNEL_LOCATION=/path/to/rockchip-${KREL}/"
+        log_hint "     然后 ./build.sh -c，把产出的 kcan.ko 拷到板上，用"
+        log_hint "       sudo ./deploy/${SCRIPT_NAME} --ko <kcan.ko>"
+        log_hint "  ② 向成都鲲弘索取本机内核版本的 aarch64 kcan.ko"
+        log_hint "     邮箱：support@cdkhdz.com / sales@cdkhdz.com"
+        log_hint "     要求：vermagic 必须等于 ${KREL}"
+        _print_kernel_header_help
+        return 0
+    fi
+
+    if (( ! KERNEL_PREPARED )); then
+        log_warn "内核树存在但未 prepared，编译可能失败"
+        log_hint "先执行: cd ${KHDR_DIR} && sudo make oldconfig && sudo make prepare"
+    fi
+
+    # --check 模式：只报告能否编译，不实际调用 make
+    if (( OPT_CHECK_ONLY )); then
+        if [[ -n "${SDK_ROOT}" ]]; then
+            log_ok "编译条件具备：内核构建树 + 厂商 SDK 源码都在"
+            log_hint "去掉 --check 后即可自动编译并安装"
+        else
+            log_warn "有内核构建树，但没找到厂商 SDK 源码"
+            log_hint "下载源码: git clone https://gitee.com/ChengDu-KunHong/KH-UCANFD_Linux_SDK.git ${PROJECT_ROOT}/.kunhong_sdk"
+            log_hint "或用 --sdk <路径> 指定已有源码目录"
+        fi
+        return 0
+    fi
+
+    if build_from_sdk; then
+        FOUND_KO="${BUILT_KO}"
+        log_ok "编译产物已就绪: ${FOUND_KO}"
+        return 0
+    fi
+
+    # 试运行不实际编译，不视为失败
+    if (( OPT_DRY_RUN )); then
+        log_info "[试运行] 未实际编译，后续步骤将跳过校验与安装"
+        log_hint "实际执行时，编译成功后会自动进入校验与安装流程"
+        return 0
+    fi
+
+    # 编译失败时的兜底提示
+    log_fail "自动编译未能产出 kcan.ko"
+
+    local sdk_state khdr_state comp_state
+    if [[ -d "${KHDR_DIR}" ]]; then khdr_state="存在"; else khdr_state="缺失"; fi
+    if [[ -n "${SDK_ROOT}" ]]; then sdk_state="${SDK_ROOT}"; else sdk_state="未找到"; fi
+    if (( COMPILE_ATTEMPTED )); then comp_state="已尝试"; else comp_state="未尝试"; fi
+
     cat >&2 <<EOF
-  文件：kcan.ko
-  架构：aarch64（ARM64）
-  内核：${KREL}      ← 必须与本机完全一致（含 CONFIG_LOCALVERSION 后缀）
-  用途：RK3588 板卡加载 USB-CAN 驱动
 
-  拿到后的放置方式（二选一）：
-      mkdir -p ${SCRIPT_DIR}/kcan-driver
-      cp /path/to/aarch64/kcan.ko ${SCRIPT_DIR}/kcan-driver/
-  或直接用参数指定：
-      sudo ./deploy/${SCRIPT_NAME} --ko /path/to/aarch64/kcan.ko
+${C_BOLD}  已尝试：${C_RESET}
+    · 定位内核构建树  → ${KHDR_DIR}（${khdr_state}）
+    · 定位厂商 SDK    → ${sdk_state}
+    · 编译            → ${comp_state}
 
-  验证方式（在开发机上拷完就能验，不需要板卡）：
-      file kcan.ko        # 必须含 "ARM aarch64"
-      modinfo kcan.ko     # vermagic 必须含 ${KREL}
+${C_BOLD}  请按以下顺序排查：${C_RESET}
+    1) 确认内核头文件：  ls -d ${KHDR_DIR}
+    2) 确认 SDK 源码：   ls ${PROJECT_ROOT}/.kunhong_sdk/KH-UCANFD_Linux_SDK-*/driver/src/
+    3) 运行自检：        ./deploy/${SCRIPT_NAME} --check
+    4) 都齐了但仍编不过：看上面 make 的报错，多半是 gcc 版本不匹配
 EOF
-    printf '\n%s  为什么不能自己编译：%s\n' "${C_BOLD}" "${C_RESET}" >&2
+    _print_kernel_header_help
+}
+
+# 内核头文件缺失时的获取指引（复用于多处）
+_print_kernel_header_help() {
+    printf '\n%s  如何拿到 %s 的内核构建树：%s\n' "${C_BOLD}" "${KREL}" "${C_RESET}" >&2
     cat >&2 <<EOF
-  kcan.ko 是内核模块，编译需要内核构建树 /lib/modules/${KREL}/build。
+  a) 先看 apt 里到底有没有（多数厂商内核没有）:
+         apt-cache policy linux-headers-${KREL}
+     若 Candidate 有版本号，装上即可:
+         sudo apt-get install -y linux-headers-${KREL}
 
-  若本机是 RK3588 厂商定制内核（如 5.10.160，Ubuntu 20.04 官方内核是 5.4.x），
-  apt 源里没有匹配的 linux-headers 包，无法在板上自行编译；
-  即便是官方内核，Ubuntu 20.04 的 linux-headers 也需与内核版本逐位对应。
-  因此本脚本只走「厂商预编译 .ko」这一条路径。
+  b) 向板卡厂商索取与内核 ${KREL} 配套的 kernel headers 或完整内核源码树
+     （Rockchip BSP 资料包里通常有），解压后放到标准位置:
+         sudo mkdir -p /lib/modules/${KREL}
+         sudo ln -sfn /path/to/kernel-source /lib/modules/${KREL}/build
+     然后用 --kernel-location 指定:
+         sudo ./deploy/${SCRIPT_NAME} --kernel-location /path/to/kernel-source
+
+  c) 不在这台机器上编译，改用交叉编译产物:
+         sudo ./deploy/${SCRIPT_NAME} --ko /path/to/aarch64/kcan.ko
 EOF
-    printf '\n' >&2
 }
 
 # =====================================================================
@@ -1168,6 +1537,42 @@ main() {
 
     # —— --uninstall 走独立流程 ——
     if (( OPT_UNINSTALL )); then
+        # --uninstall --check：只列出将会被移除的路径，不要求 root、不删任何东西
+        if (( OPT_CHECK_ONLY )); then
+            section "卸载预演（--check，只读，不修改系统）"
+            log_info "将会移除以下内容（实际执行需 sudo）："
+            local _p
+            for _p in "${MOD_INSTALL_PATH}" "${MODPROBE_CONF}" "${MODULES_LOAD_CONF}" \
+                      "${UDEV_RULE_DST}" "${BIN_DIR}"/kcan-settings; do
+                if [[ -e "${_p}" ]]; then
+                    log_info "    [存在] ${_p}"
+                else
+                    log_info "    [缺失] ${_p}"
+                fi
+            done
+            for _p in "${VENDOR_TOOLS[@]}"; do
+                if [[ -e "${BIN_DIR}/${_p}" ]]; then
+                    log_info "    [存在] ${BIN_DIR}/${_p}"
+                else
+                    log_info "    [缺失] ${BIN_DIR}/${_p}"
+                fi
+            done
+            for _p in "${VENDOR_HEADERS[@]}"; do
+                if [[ -e "${INCLUDE_DIR}/${_p}" ]]; then
+                    log_info "    [存在] ${INCLUDE_DIR}/${_p}"
+                else
+                    log_info "    [缺失] ${INCLUDE_DIR}/${_p}"
+                fi
+            done
+            if module_loaded; then
+                log_info "    [已加载] 内核模块 kcan，将从内核卸载"
+            else
+                log_info "    [未加载] 内核模块 kcan"
+            fi
+            log_ok "卸载预演完成，未修改任何文件"
+            print_summary
+            return 0
+        fi
         do_uninstall
         print_summary
         return $?

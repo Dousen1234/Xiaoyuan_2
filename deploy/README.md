@@ -116,6 +116,10 @@ sudo ./deploy/install_env.sh --skip-driver
 sudo ./deploy/install_env.sh --skip-deps --skip-build --load-driver
 ```
 
+> 💡 **只想装驱动？** 直接用 [`install_kcan.sh`](install_kcan.sh)，参数更全，
+> 且支持 `--route` / `--sdk` / `--kernel-location` / `-j` 控制编译行为，
+> 见 §7。
+
 ---
 
 ## 5. 离线依赖准备
@@ -137,12 +141,34 @@ sudo ./deploy/install_env.sh --skip-deps --skip-build --load-driver
 
 | 情况 | 走哪条路 | 命令 |
 | --- | --- | --- |
-| `/lib/modules/$(uname -r)/build` 存在且是完整 kbuild 树 | **源码编译 + DKMS**（推荐，内核升级自动重编） | `sudo ./deploy/install_drivers.sh` |
+| `/lib/modules/$(uname -r)/build` 存在且是完整 kbuild 树 | **源码编译**（脚本自动执行） | `sudo ./deploy/install_kcan.sh` |
 | 头文件不在，但 apt 源里有 `linux-headers-$(uname -r)` | 先装头文件，再源码编译 | 同上，脚本会自动尝试 |
-| 两种情况都不成立 | **用厂商提供的 aarch64 `kcan.ko`** | `sudo ./deploy/install_drivers.sh --ko /path/to/kcan.ko` |
+| 两种情况都不成立 | **用厂商提供的 aarch64 `kcan.ko`** | `sudo ./deploy/install_kcan.sh --ko /path/to/kcan.ko` |
 
-`install_drivers.sh` 的 `--kcan=auto`（默认）就是按上表顺序自动决策的，也可以用
-`--kcan=compile` / `--kcan=prebuilt` / `--kcan=skip` 强制指定。
+> ✅ **编译已全自动化**：`install_kcan.sh` 的 `--route auto`（默认）先找现成的
+> aarch64 `kcan.ko`，找不到就**自己进 SDK 目录编译** —— 先 `make clean` 清掉 SDK
+> 自带的陈旧 x86-64 `.o`，再 `make KERNEL_LOCATION=...`，产物复制到
+> `deploy/kcan-driver/kcan.ko` 后走统一的校验与安装流程。**一条命令搞定**，
+> 不用手动 `cd` 进 SDK，也不用读 `cross_compile_config.sh`。
+
+路线可以强制指定，跳过自动探测：
+
+```bash
+sudo ./deploy/install_kcan.sh --route auto       # 默认：预编译件优先，否则编译
+sudo ./deploy/install_kcan.sh --route compile    # 只走源码编译
+sudo ./deploy/install_kcan.sh --route prebuilt   # 只用现成 .ko，不编译
+sudo ./deploy/install_kcan.sh --route skip       # 跳过驱动步骤
+```
+
+编译相关补充参数：
+
+```bash
+--sdk <路径>                # 指定 SDK 根目录（默认在 .kunhong_sdk/ 下自动找）
+--kernel-location <路径>    # 指定内核构建树（默认 /lib/modules/$(uname -r)/build）
+-j <N>                      # 并行编译线程数
+```
+
+`install_drivers.sh` 也保留了自己的 `--kcan=auto|compile|prebuilt|skip`，二者语义一致。
 
 判断自己的板子属于哪种情况：
 
@@ -154,7 +180,14 @@ apt-cache policy linux-headers-$(uname -r)      # 看 Candidate 是否有版本�
 
 > ⚠️ RK3588 用的多是 Rockchip 厂商内核（如 `5.10.160`），Ubuntu 官方源
 > 通常**不提供**对应头文件。此时 `apt-cache policy` 会显示 `Candidate: (none)`，
-> 属于预期结果，只能走第三条路线。
+> 属于预期结果。这种情况下 `install_kcan.sh` 会先尝试自行编译，若确实没有内核
+> 构建树，会报出 `[警告] 内核构建树 : 未找到 /lib/modules/5.10.160/build`
+> 并打印三条补救路径（装官方头文件 / 挂载厂商内核源码 / 交叉编译后 `--ko`）。
+
+> 💡 **交叉编译**：在 x86 机器上编 aarch64 模块，把 SDK 的
+> `cross_compile_config.sh` 里 `CROSS_COMPILE` 指向工具链、`KERNEL_LOCATION`
+> 指向 aarch64 内核源码，然后 `sudo make -C driver install` 即可；产物用
+> `--ko` 拷到板上安装。
 
 > ⚠️ 厂商 SDK 压缩包里自带的 `driver/kcan.ko` 是 **x86-64** 预编译件，
 > 在 RK3588 上**无法加载**（`Exec format error`）。
@@ -384,8 +417,8 @@ sudo ./deploy/install_drivers.sh --uninstall
 
 | 步骤 | 内容 |
 | --- | --- |
-| 1 | 环境检查：root / 架构 / 内核版本 / 发行版 / 内核头文件 / `depmod` `modprobe` / Secure Boot |
-| 2 | 定位 `kcan.ko`（按搜索顺序，自动去重） |
+| 1 | 环境检查：root / 架构 / 内核版本 / 发行版 / 内核构建树 / SDK / `depmod` `modprobe` / Secure Boot |
+| 2 | 定位 `kcan.ko`（按搜索顺序自动去重）；**找不到 aarch64 件时自动编译 SDK 源码** |
 | 3 | **严格校验**：ELF 架构必须 aarch64；`vermagic` 必须与本机 `uname -r` 一致 |
 | 4 | 安装 `.ko` 到 `/lib/modules/$(uname -r)/misc/` + `depmod -a` + 写 `/etc/modprobe.d/kcan.conf` |
 | 5 | 开机自加载：写 `/etc/modules-load.d/kcan.conf`（内容仅一行 `kcan`） |
@@ -400,43 +433,68 @@ sudo ./deploy/install_drivers.sh --uninstall
 ```bash
 sudo ./deploy/install_kcan.sh [选项]
 
-  --ko <路径>      指定 kcan.ko（默认自动搜索 deploy/kcan-driver/ 等目录）
-  --reload         安装后热重载模块（会先 down 所有 canN 接口）
-  --uninstall      完整卸载：rmmod + 删除 .ko / 配置 / 工具
-  --no-autoload    不写 /etc/modules-load.d/kcan.conf（即不设开机自加载）
-  --no-tools       不安装厂商用户态工具（lskcan / kcan_monitor 等）
-  --no-headers     不安装厂商头文件（kcan.h / kcanfd.h）
-  --with-udev      安装厂商 udev 规则（/etc/udev/rules.d/45-kcan.rules）
-  --no-load        装完不执行 modprobe（只落盘，不加载）
-  --force          跳过 vermagic 严格校验（内核版本不完全一致时强行安装）
-  --check          只做检查，不修改系统（不需要 root）
-  --dry-run        打印将要执行的命令，但不实际执行
-  -y, --yes        所有确认自动回答 yes
-  -h, --help       显示本帮助
+  --ko <路径>              指定 kcan.ko（默认自动搜索 deploy/kcan-driver/ 等目录）
+  --route <路线>           驱动来源：auto（默认）/ compile / sdk / prebuilt / skip
+  --sdk <路径>             指定厂商 SDK 根目录（默认在 .kunhong_sdk/ 下自动找）
+  --kernel-location <路径> 指定内核构建树（默认 /lib/modules/$(uname -r)/build）
+  -j <N>                   编译时并行线程数
+  --reload                 安装后热重载模块（会先 down 所有 canN 接口）
+  --uninstall              完整卸载：rmmod + 删除 .ko / 配置 / 工具
+  --no-autoload            不写 /etc/modules-load.d/kcan.conf（即不设开机自加载）
+  --no-tools               不安装厂商用户态工具（lskcan / kcan_monitor 等）
+  --no-headers             不安装厂商头文件（kcan.h / kcanfd.h）
+  --with-udev              安装厂商 udev 规则（/etc/udev/rules.d/45-kcan.rules）
+  --no-load                装完不执行 modprobe（只落盘，不加载）
+  --force                  跳过 vermagic 严格校验（内核版本不完全一致时强行安装）
+  --check                  只做检查，不修改系统（不需要 root）
+  --dry-run                打印将要执行的命令，但不实际执行
+  -y, --yes                所有确认自动回答 yes
+  -h, --help               显示本帮助
 ```
+
+`--route` 的五种取值：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto` | 先找现成 aarch64 `.ko`，找不到再自动编译（**默认，推荐**） |
+| `compile` | 强制走源码编译，忽略任何现成 `.ko` |
+| `sdk` | 与 `compile` 相同（语义别名，便于记忆） |
+| `prebuilt` | 只用现成 `.ko`，找不到直接失败，不尝试编译 |
+| `skip` | 完全跳过驱动步骤（只做环境检查） |
 
 ### 7.3 典型用法
 
 ```bash
-# ① 第一次装（驱动已放到 deploy/kcan-driver/）
+# ① 第一次装（一条命令：自动找件 → 找不到就编译 → 校验 → 安装 → 加载）
 sudo ./deploy/install_kcan.sh
 
 # ② 先看清楚会改什么，再决定是否执行（不需要 root）
 ./deploy/install_kcan.sh --dry-run --check
 
-# ③ 换了新驱动，想立即生效（不重启）
+# ③ 强制走源码编译（不用任何现成 .ko）
+sudo ./deploy/install_kcan.sh --route compile
+
+# ④ 只用厂商给的 aarch64 .ko，不编译
+sudo ./deploy/install_kcan.sh --route prebuilt --ko /path/to/kcan.ko
+
+# ⑤ 交叉编译场景：指定 aarch64 内核源码树
+CROSS_COMPILE=aarch64-linux-gnu- \
+  sudo -E ./deploy/install_kcan.sh --route compile \
+  --kernel-location /opt/kernel-5.10.160 --sdk /opt/KH-UCANFD_Linux_SDK-1.4.2
+
+# ⑥ 换了新驱动，想立即生效（不重启）
 sudo ./deploy/install_kcan.sh --reload
 
-# ④ 只落盘、暂不加载（等接好线再手动 modprobe）
+# ⑦ 只落盘、暂不加载（等接好线再手动 modprobe）
 sudo ./deploy/install_kcan.sh --no-load
 
-# ⑤ 只要模块，不要开机自加载
+# ⑧ 只要模块，不要开机自加载
 sudo ./deploy/install_kcan.sh --no-autoload
 
-# ⑥ 需要 /dev/kcan-usb_x6/<adapter>/can<N> 这类稳定路径
+# ⑨ 需要 /dev/kcan-usb_x6/<adapter>/can<N> 这类稳定路径
 sudo ./deploy/install_kcan.sh --with-udev
 
-# ⑦ 出问题只诊断（只读，不改系统）
+# ⑩ 出问题只诊断（只读，不改系统）
 ./deploy/install_kcan.sh --check
 
 # ⑧ 彻底卸载
@@ -466,6 +524,99 @@ sudo ./deploy/install_kcan.sh --uninstall
 > 自动 `up` 一旦认错通道，就会向一条悬空或错误接线的总线上灌 1 Mbps 流量，
 > 轻则 `No buffer space available`，重则影响整条总线。
 > 因此**通道必须在确认接线后手动打开**。
+
+### 7.6 编译失败怎么办
+
+`--route auto`（默认）选择的编译路径依次需要三个条件，缺哪个就报哪个：
+
+```bash
+./deploy/install_kcan.sh --check        # 先看清缺什么，不需要 root
+```
+
+`--check` 会逐项报告：
+
+```
+[信息] CPU 架构     : aarch64
+[完成] 内核构建树   : /lib/modules/5.10.160/build
+[完成] 内核树状态   : 已 prepared
+[完成] 厂商 SDK     : /opt/KH-UCANFD_Linux_SDK-1.4.2
+[完成] 编译工具链   : make + gcc 就绪
+```
+
+哪一行不是 `[完成]`，就按下面对应处理：
+
+| 缺失项 | 报错关键字 | 处理办法 |
+| --- | --- | --- |
+| 内核构建树 | `未找到 /lib/modules/<ver>/build` | 见下面三种方案之一 |
+| 内核树未 prepared | `但尚未 prepare` | `cd /lib/modules/$(uname -r)/build && sudo make oldconfig && sudo make prepare modules_prepare` |
+| 厂商 SDK | `未找到厂商 SDK 源码` | 把 `KH-UCANFD_Linux_SDK-1.4.2` 解压到项目下的 `.kunhong_sdk/`，或用 `--sdk <路径>` 指定 |
+| 工具链 | `缺少 make 或 gcc` | `sudo apt install build-essential` |
+
+**缺内核构建树的三种方案（按可行性排序）：**
+
+**方案 A — 装 Ubuntu 官方头文件**（仅当板子跑的是官方内核）
+
+```bash
+apt-cache policy linux-headers-$(uname -r)
+# Candidate 有版本号才可用
+sudo apt install linux-headers-$(uname -r)
+sudo ./deploy/install_kcan.sh --route compile
+```
+
+**方案 B — 挂载 Rockchip 厂商内核源码**（RK3588 常见路径）
+
+```bash
+# 拿到与板子内核完全同版本的 Rockchip 内核源码后：
+cd /path/to/rockchip-kernel
+sudo make ARCH=arm64 olddefconfig
+sudo make ARCH=arm64 prepare modules_prepare
+# 把它挂到内核期望的位置
+sudo ln -sfn /path/to/rockchip-kernel /lib/modules/$(uname -r)/build
+sudo ./deploy/install_kcan.sh --route compile
+```
+
+> ⚠️ 若只是「版本号相同但源码不同」，编出来的 `.ko` 会因 `vermagic` 或符号
+> CRC 不匹配而加载失败。此时脚本的 `step3_validate` 会拦下并提示 `--force`
+> 仅作最后手段（强行加载仍可能在 `insmod` 阶段报 `Invalid module format`）。
+
+**方案 C — x86 上交叉编译，产物拷到板上**（最稳，推荐）
+
+```bash
+# 在 x86 开发机上
+cd /path/to/KH-UCANFD_Linux_SDK-1.4.2
+# 编辑 cross_compile_config.sh：
+#   export ARCH=arm64
+#   export CROSS_COMPILE=/opt/gcc-arm64/bin/aarch64-linux-gnu-
+#   export KERNEL_LOCATION=/opt/rockchip-kernel   # aarch64 内核源码
+source cross_compile_config.sh
+make -C driver clean
+make -C driver -j$(nproc)
+file driver/kcan.ko        # 必须是 ELF 64-bit LSB relocatable, ARM aarch64
+
+# 把 kcan.ko 拷到板子，然后：
+sudo ./deploy/install_kcan.sh --route prebuilt --ko /path/to/kcan.ko
+```
+
+> 💡 交叉编译时，内核源码版本必须**与板子上 `uname -r` 完全一致**，
+> 包括厂商的 `LOCALVERSION` 后缀（`5.10.160` 还是 `5.10.160-rockchip`）。
+> 版本不一致就用 `--force` 强装，但成功率不高——最省事的方式是直接找鲲弘
+> 技术支持（`support@cdkhdz.com`）要一个对应内核版本的 aarch64 `kcan.ko`。
+
+**如果 `make` 本身报错：**
+
+```bash
+# 完整编译日志在这里，把最后 50 行发出来即可定位
+sudo ./deploy/install_kcan.sh --route compile 2>&1 | tail -50
+```
+
+常见原因：
+
+| 现象 | 原因 |
+| --- | --- |
+| `No such file or directory: .../include/generated/autoconf.h` | 内核树没 `prepare`，见上表 |
+| `error: 'struct xxx' has no member named 'yyy'` | 厂商 SDK 与新内核 API 不兼容，需厂商适配版 |
+| `Skipping BTF generation ... due to unavailability of vmlinux` | **只是跳过 BTF，不影响 `.ko` 生成**，可忽略 |
+| `warning: the compiler differs from the one used to build the kernel` | **只是警告**，编译器版本号一致即可忽略 |
 
 ---
 
