@@ -58,11 +58,38 @@
  *   move <腿1-4> <J1-J4> <cw|ccw> <角度°> [时长s]   相对转动（例：move 1 J1 cw 90）
  *   goto <腿1-4> <J1-J4> <角度°> [时长s]            转到绝对关节角（例：goto 1 J2 45）
  *   pos  [腿1-4]                                     查询关节当前位置（读 10Hz 反馈缓存，不占总线）
- *   stat                                             流模式统计（各腿收帧/丢弃/电机在线/软限位）
+ *   stat                                             流模式统计（各腿收帧/钳位/电机在线/软限位）
  *   estop                                            急停：全部电机立即抱闸并锁定
  *   resume                                           解除急停锁定（电机保持抱闸，等新目标）
  *   clear                                            清除软限位报警锁定（同上位机 [0x03]）
  *   quit                                             退出（全部电机抱闸后退出）
+ *
+ * ======================= 启动参数（可调项，--help 查看全部） =======================
+ *
+ * 不带任何参数运行 = 历史交互流程：依次询问「启用的腿」与「上位机 CAN 接口名」。
+ * 带参数时跳过对应提问，便于脚本化启动（systemd / ROS2 launch）与现场试参。
+ * 所有参数默认值等于历史硬编码值 ⇒ 改参数不影响协议，也不改变默认行为。
+ *
+ *   --legs "1 2 3 4"          启用的腿（all = 全部）
+ *   --host <接口名>            上位机 CAN 接口（不可用 can0~can3）
+ *   --no-host                 不启用上位机链路（仅键盘命令）
+ *   --interactive             强制回到交互式提问
+ *   --dry-run                 只校验参数并打印生效配置后退出（不碰 CAN，返回 0）
+ *
+ *   --limits "a,b;c,d;e,f;g,h"  J1~J4 软限位 {min,max}（关节端度）
+ *   --trigger-deg <度>         限位触发阈值（默认 0.5，须大于 PD 稳态误差）
+ *   --rearm-deg <度>           解除锁定后重新武装的回差（默认 2.0）
+ *   --dir-sign "+1,+1,+1,+1"   关节方向符号（仅 ±1）
+ *   --gear "101,162,162,101"   关节端总减速比（仅影响速度换算）
+ *   --motor-scale "1,2,2,1"    电机输出端角 / 关节角
+ *
+ *   --kp / --kd <int>          位置环增益（默认 4000 / 60，写入电机固件）
+ *   --stream-timeout-ms <ms>   断流超时（默认 1000）
+ *   --heartbeat-ms <ms>        心跳 0x161 周期（默认 200）
+ *   --alarm-ms <ms>            报警 0x162 重发周期（默认 200）
+ *   --feedback-hz <hz>         反馈回传频率（默认 10，范围 1~100）
+ *
+ * 退出码：0 正常；-1 输入中断/交互失败；2 命令行参数非法。
  *
  * ============================= 单位与符号约定 =============================
  *
@@ -80,6 +107,8 @@
  *   | J3   | 3 (P2) | P    | 81        | 锥齿轮 1:2（关节减速）| 81×2 = 162   |
  *   | J4   | 4      | Y    | 101       | 直驱（无）          | 101            |
  *
+ * 上表为**默认值**；减速比、传动系数、方向符号、软限位、KP/KD、通讯周期
+ * 均可在启动时用命令行参数覆盖（`--help` 查看），不带参数时等于上表。
  * 符号约定：与 taihu_singleleg_step_xCAN 保持一致——电机输出端正角度 = 逆时针。
  * 因此本 demo 约定：关节端正角度 = 逆时针（ccw），cw = 负角度。
  * 依据：xCAN demo 的关键帧 {0, 180, 180, 0} 里 ID2/ID3 同为 +180°（两个 P 型锥齿轮
@@ -175,13 +204,26 @@ namespace
     /// 四个电机的 CAN ID（J1~J4 顺序）
     const uint32_t kMotorIds[kJointCount] = {1, 2, 3, 4};
 
+    // =====================================================================
+    // 【运行时可变参数】—— 下列变量在启动参数解析阶段写入一次，
+    // 解析结束后即视为只读；默认值与历史版本逐项一致，不带参数运行时
+    // 行为与旧版本完全相同。
+    //
+    // 可用命令行参数覆盖（见 --help）：
+    //   --legs / --host / --limits / --dir-sign / --gear / --motor-scale
+    //   --kp / --kd / --trigger-deg / --rearm-deg / --stream-timeout-ms
+    //   --heartbeat-ms / --alarm-ms / --feedback-hz
+    // =====================================================================
+
     /// 关节端总减速比（速度换算用：转子 → 关节）
     ///   J1/J4 直驱 = 电机减速比 101；J2/J3 = 电机 81 × 锥齿轮 2 = 162
-    const double kJointGearRatios[kJointCount] = {101.0, 162.0, 162.0, 101.0};
+    /// 可用 --gear 覆盖。注意：只影响速度换算，不影响位置/方向/限位。
+    double kJointGearRatios[kJointCount] = {101.0, 162.0, 162.0, 101.0};
 
     /// 位置换算系数：电机输出端角 = 关节角 × 该系数
     ///   Y 直驱 = 1；P 锥齿轮 1:2（电机端转 2、关节转 1）= 2
-    const double kMotorRadPerJointRad[kJointCount] = {1.0, 2.0, 2.0, 1.0};
+    /// 可用 --motor-scale 覆盖（仅现场传动比改动时才需要）。
+    double kMotorRadPerJointRad[kJointCount] = {1.0, 2.0, 2.0, 1.0};
 
     /// 关节方向符号（+1 = 关节端正方向对应电机端正方向）。
     ///
@@ -191,17 +233,19 @@ namespace
     /// 中 ID2/ID3 同为 **+180°**，说明两个 P 型锥齿轮（J2/J3）在电机端同向，
     /// 故关节端与电机端同号，四个关节均取 +1。
     /// 若现场发现某关节因锥齿轮装反而方向相反，只改对应元素为 -1 即可（限位是
-    /// 关节端语义，改符号后限位表不需要跟着改）。
-    const double kJointDirSign[kJointCount] = {1.0, 1.0, 1.0, 1.0};
+    /// 关节端语义，改符号后限位表不需要跟着改）。可用 --dir-sign 覆盖，
+    /// 例如 --dir-sign +1,-1,+1,+1。
+    double kJointDirSign[kJointCount] = {1.0, 1.0, 1.0, 1.0};
 
-    /// 软件限位（**关节端**，度）：{min, max}。判定与丢弃均按关节端角进行。
+    /// 软件限位（**关节端**，度）：{min, max}。判定与钳位均按关节端角进行。
     ///
     /// 电机端等效范围 = 关节端限位 × kMotorRadPerJointRad（J2/J3 锥齿轮 1:2 为 ×2）：
     ///   J1 直驱      ：关节端 ±90°        ↔ 电机端 ±90°
     ///   J2 锥齿轮 1:2：关节端 ±120°       ↔ 电机端 ±240°
     ///   J3 锥齿轮 1:2：关节端 −30°~+180°  ↔ 电机端 −60°~+360°
     ///   J4 直驱      ：关节端 ±90°        ↔ 电机端 ±90°
-    const double kJointLimitDeg[kJointCount][2] = {
+    /// 可用 --limits 覆盖，格式：min1,max1;min2,max2;min3,max3;min4,max4
+    double kJointLimitDeg[kJointCount][2] = {
         {-90.0, 90.0},   ///< J1（Y 直驱，电机端 ±90°）
         {-120.0, 120.0}, ///< J2（P1 锥齿轮 1:2，CAN ID 2，电机端 ±240°）
         {-30.0, 180.0},  ///< J3（P2 锥齿轮 1:2，CAN ID 3，电机端 −60°~+360°）
@@ -209,8 +253,10 @@ namespace
     };
 
     // —— 位置环增益（与 taihu_singleleg_step_xCAN 一致） ——
-    constexpr int32_t kPositionKp = 4000;
-    constexpr int32_t kPositionKd = 60;
+    //    可用 --kp / --kd 覆盖。注意：这是写进电机固件的参数，改动后
+    //    上电初始化时生效。
+    int32_t kPositionKp = 4000;
+    int32_t kPositionKd = 60;
 
     // =====================================================================
     // 上位机 ⇄ 下位机 通讯协议常量（协议全文见 docs/step_protocol.pdf）
@@ -254,18 +300,20 @@ namespace
 
     /// 心跳帧 ID（0x161，DLC=1 状态字节；避开关节 ID 1~16）
     constexpr uint16_t kHeartbeatId = 0x161;
-    /// 心跳发送周期（ms）
-    constexpr int kHeartbeatMs = 200;
+    /// 心跳发送周期（ms）——可用 --heartbeat-ms 覆盖
+    int kHeartbeatMs = 200;
 
     /// 上位机发送频率（Hz，协议约定，用于断流判定与回传节流）
     constexpr int kHostStreamHz = 10;
     /// 反馈回传周期（ms）= 1000/kHostStreamHz；实际角由总线线程 10Hz 轮询电机
     /// 得到，回传同频即可保证每帧都是新鲜值（200Hz 回传只会重复缓存，徒增带宽）
-    constexpr int kFeedbackMs = 1000 / kHostStreamHz;
+    /// 可用 --feedback-hz 覆盖（合法范围 1~100Hz）。
+    int kFeedbackMs = 1000 / kHostStreamHz;
     /// 总线线程读电机实际位置（0x41 三合一）的周期（ms，10Hz）
-    constexpr int kReadPeriodMs = 100;
+    int kReadPeriodMs = 100;
     /// 断流保护：流模式下超过此时长无新样点 → 自动退出流模式（电机保持）
-    constexpr int kStreamTimeoutMs = 1000;
+    /// 可用 --stream-timeout-ms 覆盖。
+    int kStreamTimeoutMs = 1000;
 
     // —— 协议功能码（与钛虎电机协议同码，帧结构同构） ——
     constexpr uint8_t kHostCmdSetPos = 0x1E;     ///< 目标位置（int32 = rad × 10000）
@@ -291,15 +339,18 @@ namespace
     constexpr uint8_t kLimitSideMax = 0x01; ///< 撞上限（kJointLimitDeg[j][1]）
     constexpr uint8_t kLimitSideMin = 0x02; ///< 撞下限（kJointLimitDeg[j][0]）
     /// 报警帧重发周期（ms）——与心跳同频，锁定期间持续上报
-    constexpr int kLimitAlarmMs = 200;
+    /// 可用 --alarm-ms 覆盖。
+    int kLimitAlarmMs = 200;
 
     /// 限位触发阈值（度）：实际角进入「限位 - 阈值 ~ 限位」区间即判定到达。
     /// 取值需大于电机 PD 稳态误差（否则永远报不出来），又要足够小以免误报。
-    constexpr double kLimitTriggerDeg = 0.5;
+    /// 可用 --trigger-deg 覆盖。
+    double kLimitTriggerDeg = 0.5;
     /// 限位解除回差（度）：实际角退出「限位 - 回差」以外才认为离开限位。
     /// 仅在需要「位置回退自动清除」时使用；当前策略是锁定需上位机 [0x03]，
     /// 此常量用于锁定解除后重新武装（re-arm）的判定，防止抖动反复触发。
-    constexpr double kLimitRearmDeg = 2.0;
+    /// 可用 --rearm-deg 覆盖。
+    double kLimitRearmDeg = 2.0;
 
     // —— 轨迹与执行参数 ——
     constexpr double kDefaultMoveSec = 2.0; ///< 默认轨迹时长 (s)
@@ -432,7 +483,9 @@ namespace
 
         // —— 流模式统计（host 线程写，主线程 stat 读）——
         std::atomic<uint32_t> rx_frames{0}; ///< 该腿累计收到的 0x1E 目标帧数
-        std::atomic<uint32_t> dropped{0};   ///< 该腿累计丢弃帧数（越限/急停锁定）
+        /// 该腿累计「未按原值执行」的帧数：越限被钳位 + 急停/限位锁定期间丢弃。
+        /// 注意：越限帧是【钳位后照常下发】，并非丢弃，此计数含钳位事件。
+        std::atomic<uint32_t> dropped{0};
     };
 
     // =====================================================================
@@ -758,8 +811,8 @@ namespace
     void busThread(Leg &leg)
     {
         int64_t last_read_ms = 0;
-        int offline_streak[kJointCount] = {0};       ///< 各关节连续读失败次数（退避用）
-        int64_t backoff_until_ms[kJointCount] = {0}; ///< 退避截止时刻（跳过读取）
+        int offline_streak[kJointCount] = {0};                 ///< 各关节连续读失败次数（退避用）
+        int64_t backoff_until_ms[kJointCount] = {0};           ///< 退避截止时刻（跳过读取）
         bool rearm_ok[kJointCount] = {true, true, true, true}; ///< 各关节已退离限位
                                                                ///< （防空转复发）
 
@@ -1240,6 +1293,422 @@ namespace
         return true;
     }
 
+    // =====================================================================
+    // 启动参数解析（命令行 → 运行时可变参数）
+    //
+    // 设计原则：**不带任何参数运行时，行为与历史版本完全一致**——仍然
+    // 逐项交互式询问「启用的腿」与「上位机 CAN 接口」。带参数时跳过对应
+    // 提问，便于脚本化启动（systemd/ROS2 launch）与现场快速试参。
+    // =====================================================================
+
+    /// 启动参数（只记录「是否显式指定」，取值直接写入运行时可变参数）
+    struct StartupArgs
+    {
+        bool show_help = false;  ///< --help：打印参数说明后退出
+        bool dry_run = false;    ///< --dry-run：只校验参数，不打开 CAN
+        bool legs_given = false; ///< 给了 --legs → 不再提问腿号
+        bool host_given = false; ///< 给了 --host/--no-host → 不再提问
+        bool want[kLegCount + 1] = {false, false, false, false, false};
+        std::string host_ifname; ///< 上位机 CAN 接口名（空 = 跳过链路）
+    };
+
+    /// 解析逗号/分号/空格分隔的 N 个浮点值到 dst（N = kJointCount）。
+    bool parseFourDoubles(const char *tok, double dst[kJointCount],
+                          double lo, double hi)
+    {
+        if (tok == nullptr)
+            return false;
+        std::string s(tok);
+        if (s.empty())
+            return false;
+        char *save = nullptr;
+        int i = 0;
+        for (char *t = strtok_r(&s[0], ",;: \t", &save); t != nullptr;
+             t = strtok_r(nullptr, ",;: \t", &save), ++i)
+        {
+            if (i >= kJointCount || !parseDouble(t, lo, hi, dst[i]))
+                return false;
+        }
+        return i == kJointCount;
+    }
+
+    /// 解析 --limits："-90,90;-120,120;-30,180;-90,90"（4 组关节端限位，度）。
+    bool parseLimits(const char *tok)
+    {
+        if (tok == nullptr)
+            return false;
+        std::string s(tok);
+        if (s.empty())
+            return false;
+        char *save = nullptr;
+        int joint = 0;
+        for (char *grp = strtok_r(&s[0], ";", &save); grp != nullptr;
+             grp = strtok_r(nullptr, ";", &save), ++joint)
+        {
+            if (joint >= kJointCount)
+                return false;
+            char *save2 = nullptr;
+            const char *lo_tok = strtok_r(grp, ", \t", &save2);
+            const char *hi_tok = strtok_r(nullptr, ", \t", &save2);
+            double lo = 0.0, hi = 0.0;
+            if (!parseDouble(lo_tok, -360.0, 360.0, lo) ||
+                !parseDouble(hi_tok, -360.0, 360.0, hi) || lo >= hi)
+                return false;
+            kJointLimitDeg[joint][0] = lo;
+            kJointLimitDeg[joint][1] = hi;
+        }
+        return joint == kJointCount;
+    }
+
+    /// 解析 --legs："1 2 3" / "1,2,3" / "all"。
+    bool parseLegList(const char *tok, StartupArgs &out)
+    {
+        if (tok == nullptr)
+            return false;
+        if (std::strcmp(tok, "all") == 0)
+        {
+            for (int i = 1; i <= kLegCount; ++i)
+                out.want[i] = true;
+            return true;
+        }
+        std::string s(tok);
+        if (s.empty())
+            return false;
+        char *save = nullptr;
+        int n = 0;
+        for (char *t = strtok_r(&s[0], ",;: \t", &save); t != nullptr;
+             t = strtok_r(nullptr, ",;: \t", &save))
+        {
+            int leg = 0;
+            if (!parseLeg(t, leg))
+                return false;
+            out.want[leg] = true;
+            ++n;
+        }
+        return n > 0;
+    }
+
+    /// 打印命令行参数说明（--help）。
+    void printCliHelp()
+    {
+        std::printf(
+            "用法：walk_control_V1 [选项]\n"
+            "\n"
+            "不带任何选项运行 = 历史交互流程（依次询问启用的腿、上位机接口名）。\n"
+            "带选项时跳过对应提问；所有选项的默认值等于历史硬编码值。\n"
+            "\n"
+            "构型与接入：\n"
+            "  --legs \"1 2 3 4\"       启用的腿（空格/逗号分隔，all=全部）\n"
+            "  --host <接口名>          上位机 CAN 接口（如 can4；不可用 can0~can3）\n"
+            "  --no-host                不启用上位机链路（仅键盘命令）\n"
+            "  --interactive            强制回到交互式提问（覆盖上面的跳过行为）\n"
+            "  --dry-run                只解析参数并打印生效配置后退出（不碰 CAN）\n"
+            "\n"
+            "限位与传动（均为**关节端**语义）：\n"
+            "  --limits \"a,b;c,d;e,f;g,h\"   J1~J4 的 {min,max}（度），默认 "
+            "-90,90;-120,120;-30,180;-90,90\n"
+            "  --trigger-deg <度>        限位触发阈值（默认 0.5，需大于 PD 稳态误差）\n"
+            "  --rearm-deg <度>          解除锁定后重新武装的回差（默认 2.0）\n"
+            "  --dir-sign \"+1,+1,+1,+1\" 关节方向符号（仅 ±1；锥齿轮装反时改 -1）\n"
+            "  --gear \"101,162,162,101\" 关节端总减速比（仅影响速度换算）\n"
+            "  --motor-scale \"1,2,2,1\"  电机输出端角 / 关节角（锥齿轮 1:2 填 2）\n"
+            "\n"
+            "电机位置环与通讯节奏：\n"
+            "  --kp <int>                位置环 KP（默认 4000，写入电机固件）\n"
+            "  --kd <int>                位置环 KD（默认 60）\n"
+            "  --stream-timeout-ms <ms>  断流超时，超时自动退出流模式（默认 1000）\n"
+            "  --heartbeat-ms <ms>       心跳 0x161 周期（默认 200）\n"
+            "  --alarm-ms <ms>           软限位报警 0x162 重发周期（默认 200）\n"
+            "  --feedback-hz <hz>        反馈回传频率（默认 10，范围 1~100）\n"
+            "\n"
+            "示例：\n"
+            "  walk_control_V1                                     # 历史交互流程\n"
+            "  walk_control_V1 --legs 1 --host can4                # 单腿 + 上位机链路\n"
+            "  walk_control_V1 --legs all --no-host --kp 3000      # 全部腿，仅键盘\n"
+            "  walk_control_V1 --limits \"-45,45;-60,60;-15,90;-45,45\"  # 缩小限位试限\n"
+            "  walk_control_V1 --dry-run --legs 1 --host can4      # 只校验参数\n");
+    }
+
+    /// 解析全部命令行参数。
+    /// @return false 表示参数非法（原因已打印）；true 表示可继续启动。
+    bool parseArgs(int argc, char **argv, StartupArgs &out)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string key = argv[i];
+            const char *val = (i + 1 < argc) ? argv[i + 1] : nullptr;
+
+            // 取一个取值（成功则把 i 推进到该取值）
+            auto take = [&](const char *what) -> const char *
+            {
+                if (val == nullptr)
+                {
+                    std::printf("[参数][错误] %s 缺少取值\n", what);
+                    return nullptr;
+                }
+                ++i;
+                return val;
+            };
+
+            if (key == "--help" || key == "-h")
+            {
+                out.show_help = true;
+                return true;
+            }
+            else if (key == "--legs")
+            {
+                const char *v = take("--legs");
+                if (v == nullptr)
+                    return false;
+                for (int k = 0; k <= kLegCount; ++k)
+                    out.want[k] = false;
+                if (!parseLegList(v, out))
+                {
+                    std::printf("[参数][错误] --legs 取值非法：\"%s\""
+                                "（示例：\"1 2 3\" 或 \"all\"）\n",
+                                v);
+                    return false;
+                }
+                out.legs_given = true;
+            }
+            else if (key == "--host")
+            {
+                const char *v = take("--host");
+                if (v == nullptr)
+                    return false;
+                out.host_ifname = v;
+                out.host_given = true;
+            }
+            else if (key == "--no-host" || key == "--no-host-link")
+            {
+                out.host_ifname.clear();
+                out.host_given = true;
+            }
+            else if (key == "--interactive")
+            {
+                out.legs_given = false;
+                out.host_given = false;
+            }
+            else if (key == "--dry-run")
+            {
+                out.dry_run = true;
+            }
+            else if (key == "--limits")
+            {
+                const char *v = take("--limits");
+                if (v == nullptr)
+                    return false;
+                if (!parseLimits(v))
+                {
+                    std::printf("[参数][错误] --limits 取值非法：\"%s\""
+                                "（示例：\"-90,90;-120,120;-30,180;-90,90\"）\n",
+                                v);
+                    return false;
+                }
+            }
+            else if (key == "--trigger-deg")
+            {
+                const char *v = take("--trigger-deg");
+                if (v == nullptr)
+                    return false;
+                if (!parseDouble(v, 0.0, 45.0, kLimitTriggerDeg))
+                {
+                    std::printf("[参数][错误] --trigger-deg 需为 0~45 度\n");
+                    return false;
+                }
+            }
+            else if (key == "--rearm-deg")
+            {
+                const char *v = take("--rearm-deg");
+                if (v == nullptr)
+                    return false;
+                if (!parseDouble(v, 0.0, 90.0, kLimitRearmDeg))
+                {
+                    std::printf("[参数][错误] --rearm-deg 需为 0~90 度\n");
+                    return false;
+                }
+            }
+            else if (key == "--dir-sign")
+            {
+                const char *v = take("--dir-sign");
+                if (v == nullptr)
+                    return false;
+                double tmp[kJointCount];
+                if (!parseFourDoubles(v, tmp, -1.0, 1.0))
+                {
+                    std::printf("[参数][错误] --dir-sign 需为 4 个 +1/-1\n");
+                    return false;
+                }
+                for (int j = 0; j < kJointCount; ++j)
+                {
+                    if (std::fabs(tmp[j]) != 1.0)
+                    {
+                        std::printf("[参数][错误] --dir-sign 每项只能为 +1 或 -1\n");
+                        return false;
+                    }
+                    kJointDirSign[j] = tmp[j];
+                }
+            }
+            else if (key == "--gear")
+            {
+                const char *v = take("--gear");
+                if (v == nullptr)
+                    return false;
+                if (!parseFourDoubles(v, kJointGearRatios, 1.0, 10000.0))
+                {
+                    std::printf("[参数][错误] --gear 需为 4 个正数"
+                                "（示例：\"101,162,162,101\"）\n");
+                    return false;
+                }
+            }
+            else if (key == "--motor-scale")
+            {
+                const char *v = take("--motor-scale");
+                if (v == nullptr)
+                    return false;
+                if (!parseFourDoubles(v, kMotorRadPerJointRad, 0.01, 100.0))
+                {
+                    std::printf("[参数][错误] --motor-scale 需为 4 个正数"
+                                "（示例：\"1,2,2,1\"）\n");
+                    return false;
+                }
+            }
+            else if (key == "--kp")
+            {
+                const char *v = take("--kp");
+                if (v == nullptr)
+                    return false;
+                char *end = nullptr;
+                const long n = std::strtol(v, &end, 10);
+                if (end == v || *end != '\0' || n < 0 || n > 100000)
+                {
+                    std::printf("[参数][错误] --kp 需为 0~100000 的整数\n");
+                    return false;
+                }
+                kPositionKp = static_cast<int32_t>(n);
+            }
+            else if (key == "--kd")
+            {
+                const char *v = take("--kd");
+                if (v == nullptr)
+                    return false;
+                char *end = nullptr;
+                const long n = std::strtol(v, &end, 10);
+                if (end == v || *end != '\0' || n < 0 || n > 100000)
+                {
+                    std::printf("[参数][错误] --kd 需为 0~100000 的整数\n");
+                    return false;
+                }
+                kPositionKd = static_cast<int32_t>(n);
+            }
+            else if (key == "--stream-timeout-ms")
+            {
+                const char *v = take("--stream-timeout-ms");
+                if (v == nullptr)
+                    return false;
+                char *end = nullptr;
+                const long n = std::strtol(v, &end, 10);
+                if (end == v || *end != '\0' || n < 20 || n > 60000)
+                {
+                    std::printf("[参数][错误] --stream-timeout-ms 需为 20~60000\n");
+                    return false;
+                }
+                kStreamTimeoutMs = static_cast<int>(n);
+            }
+            else if (key == "--heartbeat-ms")
+            {
+                const char *v = take("--heartbeat-ms");
+                if (v == nullptr)
+                    return false;
+                char *end = nullptr;
+                const long n = std::strtol(v, &end, 10);
+                if (end == v || *end != '\0' || n < 10 || n > 5000)
+                {
+                    std::printf("[参数][错误] --heartbeat-ms 需为 10~5000\n");
+                    return false;
+                }
+                kHeartbeatMs = static_cast<int>(n);
+            }
+            else if (key == "--alarm-ms")
+            {
+                const char *v = take("--alarm-ms");
+                if (v == nullptr)
+                    return false;
+                char *end = nullptr;
+                const long n = std::strtol(v, &end, 10);
+                if (end == v || *end != '\0' || n < 10 || n > 5000)
+                {
+                    std::printf("[参数][错误] --alarm-ms 需为 10~5000\n");
+                    return false;
+                }
+                kLimitAlarmMs = static_cast<int>(n);
+            }
+            else if (key == "--feedback-hz")
+            {
+                const char *v = take("--feedback-hz");
+                if (v == nullptr)
+                    return false;
+                char *end = nullptr;
+                const long n = std::strtol(v, &end, 10);
+                if (end == v || *end != '\0' || n < 1 || n > 100)
+                {
+                    std::printf("[参数][错误] --feedback-hz 需为 1~100\n");
+                    return false;
+                }
+                kFeedbackMs = 1000 / static_cast<int>(n);
+                // 反馈周期不会快于总线线程读电机的周期，否则只是重复缓存
+                if (kFeedbackMs < kReadPeriodMs)
+                {
+                    std::printf("[参数][提示] --feedback-hz %ld 快于总线读取周期"
+                                "（%dms / %dHz），回传周期按 %dms 生效\n",
+                                n, kReadPeriodMs, 1000 / kReadPeriodMs,
+                                kReadPeriodMs);
+                    kFeedbackMs = kReadPeriodMs;
+                }
+            }
+            else
+            {
+                std::printf("[参数][错误] 未知选项 \"%s\"（--help 查看全部选项）\n",
+                            key.c_str());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// 打印当前生效的可调参数（启动时一行摘要；--dry-run 时逐项展开）。
+    void printEffectiveConfig(bool verbose)
+    {
+        std::printf("[参数] 限位(关节端°) J1 [%.0f,%.0f] J2 [%.0f,%.0f] "
+                    "J3 [%.0f,%.0f] J4 [%.0f,%.0f]\n",
+                    kJointLimitDeg[0][0], kJointLimitDeg[0][1],
+                    kJointLimitDeg[1][0], kJointLimitDeg[1][1],
+                    kJointLimitDeg[2][0], kJointLimitDeg[2][1],
+                    kJointLimitDeg[3][0], kJointLimitDeg[3][1]);
+        std::printf("[参数] KP=%d KD=%d 触发=%.2f° 回差=%.1f° "
+                    "断流=%dms 心跳=%dms 报警=%dms 反馈=%dms\n",
+                    kPositionKp, kPositionKd, kLimitTriggerDeg, kLimitRearmDeg,
+                    kStreamTimeoutMs, kHeartbeatMs, kLimitAlarmMs, kFeedbackMs);
+        std::printf("[参数] 方向符号 %+.0f %+.0f %+.0f %+.0f；"
+                    "电机端/关节端 %g %g %g %g；减速比 %g %g %g %g\n",
+                    kJointDirSign[0], kJointDirSign[1],
+                    kJointDirSign[2], kJointDirSign[3],
+                    kMotorRadPerJointRad[0], kMotorRadPerJointRad[1],
+                    kMotorRadPerJointRad[2], kMotorRadPerJointRad[3],
+                    kJointGearRatios[0], kJointGearRatios[1],
+                    kJointGearRatios[2], kJointGearRatios[3]);
+        if (!verbose)
+            return;
+        std::printf("[参数] 关节端限位对应的电机端等效范围：\n");
+        for (int j = 0; j < kJointCount; ++j)
+            std::printf("         %s：关节端 [%+7.1f°, %+7.1f°]"
+                        " ↔ 电机端 [%+8.1f°, %+8.1f°]\n",
+                        kJointNames[j],
+                        kJointLimitDeg[j][0], kJointLimitDeg[j][1],
+                        kJointLimitDeg[j][0] * kMotorRadPerJointRad[j],
+                        kJointLimitDeg[j][1] * kMotorRadPerJointRad[j]);
+    }
+
     /// 解析 pos 命令：pos 不入队，主线程直接读 10Hz 反馈缓存打印（零总线流量）。
     /// @return true 表示该行确实是 pos 命令（leg_out：1~4，0 = 全部腿）。
     bool tryParsePos(char *line, int &leg_out)
@@ -1383,7 +1852,7 @@ namespace
             "  move <腿1-4> <J1-J4> <cw|ccw> <角度°> [时长s]  相对转动，例：move 1 J1 cw 90\n"
             "  goto <腿1-4> <J1-J4> <角度°> [时长s]           绝对关节角，例：goto 1 J2 45\n"
             "  pos  [腿1-4]                                    查询当前位置（读 10Hz 缓存，缺省=全部腿）\n"
-            "  stat                                            流模式统计（各腿收帧/丢弃/电机在线/使能）\n"
+            "  stat                                            流模式统计（各腿收帧/钳位/电机在线/使能）\n"
             "  arm                                             使能：解除全部腿的抱闸（启动时已自动执行）\n"
             "  disarm                                          去使能：全部电机抱闸并锁定\n"
             "  estop                                           急停（全部电机抱闸并锁定）\n"
@@ -1398,7 +1867,8 @@ namespace
             "      ID=(腿-1)×4+关节号，10Hz（协议见 docs/step_protocol.pdf）。\n"
             "      流模式中 move/goto 暂缓；急停锁定期间上位机目标一律丢弃。\n"
             "      ★ 软限位保护：越限目标钳位到限位值下发；实际角到达限位时整机锁定并\n"
-            "        以 ID 0x162 上报报警（200ms 重发），需 [0x03] 或 clear 解除。\n",
+            "        以 ID 0x162 上报报警（200ms 重发），需 [0x03] 或 clear 解除。\n"
+            "      启动参数（限位/KP/KD/超时/接口名等）见命令行 --help。\n",
             kDefaultMoveSec, kAngleScale);
     }
 
@@ -1460,61 +1930,96 @@ namespace
 
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
+    // 0. 解析命令行参数（--help / 未知选项 / 非法取值都在此退出）。
+    //    不带任何参数时 legs_given / host_given 均为 false，后续仍走
+    //    交互式提问 —— 与历史版本行为完全一致。
+    StartupArgs args;
+    if (!parseArgs(argc, argv, args))
+        return 2;
+    if (args.show_help)
+    {
+        printCliHelp();
+        return 0;
+    }
+
     std::printf("============================================================\n");
     std::printf("  四腿机器人【下位机】walk_control_V1（上位机轨迹流拆分 + 关节级命令）\n");
     std::printf("============================================================\n");
     std::printf("  构型：4 腿 × 4 关节 YPPY（腿 i ↔ can%d~can%d，电机 ID 1~4）\n", 0, kLegCount - 1);
-    std::printf("        J1/J4 = Y 直驱（减速比 101）；J2/J3 = P 锥齿轮 1:2（162）\n");
+    std::printf("        J1/J4 = Y 直驱；J2/J3 = P 锥齿轮 1:2（减速比见下方 [参数] 行）\n");
     std::printf("  上位机：独立 CAN 接口，ID 1~16 = (腿-1)×4+关节号，\n");
     std::printf("          [0x1E][int32 小端 = 关节端 rad × %.0f]，10Hz；\n", kAngleScale);
     std::printf("          本机拆分后按钛虎原生协议下发真电机（电机内部 PD 执行）\n");
     std::printf("  角度：按【关节端】计算；ccw（逆时针）= 正，与 xCAN 电机方向一致\n");
-    std::printf("  限位：关节端 J1 ±90°，J2 ±120°，J3 -30°~+180°，J4 ±90°\n");
-    std::printf("        （电机端等效：J2 ±240°，J3 -60°~+360°）\n");
     std::printf("  软保护：越限目标钳位到限位值下发；实际角到达限位 → 整机锁定，\n");
     std::printf("          以 ID 0x162 上报报警（200ms 重发），需 [0x03] 或 clear 解除\n");
     std::printf("  使能：启动时自动解除抱闸（arm 重新使能 / disarm 抱闸）\n");
     std::printf("  例：move 1 J1 cw 90  →  腿1 的 J1 顺时针转 90°（平滑轨迹）\n");
+    std::printf("  提示：walk_control_V1 --help 查看全部可调参数\n");
     std::printf("------------------------------------------------------------\n");
-
-    // 1. 选择要启用的腿（直接回车 = 全部；现场只接部分腿时可只输入如 1）
-    std::printf("请输入要启用的腿号（1~4，空格分隔，直接回车=全部）：");
-    char line[256] = {0};
-    if (std::fgets(line, sizeof line, stdin) == nullptr)
-        return -1;
-    chomp(line);
-
+    if (!args.dry_run)
+        printEffectiveConfig(/*verbose=*/false);
+    //    交互式：直接回车 = 全部；现场只接部分腿时可只输入如 1）
     bool want[kLegCount + 1] = {false, false, false, false, false};
-    if (line[0] == '\0')
+    char line[256] = {0};
+    if (args.legs_given)
     {
+        for (int i = 0; i <= kLegCount; ++i)
+            want[i] = args.want[i];
+        std::printf("[参数] 启用腿：");
         for (int i = 1; i <= kLegCount; ++i)
-            want[i] = true;
+            if (want[i])
+                std::printf("%d ", i);
+        std::printf("（来自 --legs）\n");
     }
     else
     {
-        char *save = nullptr;
-        for (char *tok = strtok_r(line, " \t", &save); tok != nullptr;
-             tok = strtok_r(nullptr, " \t", &save))
+        std::printf("请输入要启用的腿号（1~4，空格分隔，直接回车=全部）：");
+        if (std::fgets(line, sizeof line, stdin) == nullptr)
+            return -1;
+        chomp(line);
+
+        if (line[0] == '\0')
         {
-            int leg = 0;
-            if (!parseLeg(tok, leg))
+            for (int i = 1; i <= kLegCount; ++i)
+                want[i] = true;
+        }
+        else
+        {
+            char *save = nullptr;
+            for (char *tok = strtok_r(line, " \t", &save); tok != nullptr;
+                 tok = strtok_r(nullptr, " \t", &save))
             {
-                std::printf("[格式] 腿号需为 1~4，收到 \"%s\"\n", tok);
-                return -1;
+                int leg = 0;
+                if (!parseLeg(tok, leg))
+                {
+                    std::printf("[格式] 腿号需为 1~4，收到 \"%s\"\n", tok);
+                    return -1;
+                }
+                want[leg] = true;
             }
-            want[leg] = true;
         }
     }
 
     // 2. 输入上位机 CAN 接口名（必须是独立接口，不能与电机总线 can0~can3
     //    共用——否则上位机发的 ID 1~4 会被腿 1 真电机直接执行）
-    std::printf("请输入上位机 CAN 接口名（如 can4/can5，直接回车=跳过上位机链路）：");
-    if (std::fgets(line, sizeof line, stdin) == nullptr)
-        return -1;
-    chomp(line);
-    std::string host_ifname = line;
+    std::string host_ifname;
+    if (args.host_given)
+    {
+        host_ifname = args.host_ifname;
+        std::printf("[参数] 上位机接口：%s（来自命令行）\n",
+                    host_ifname.empty() ? "（不启用）" : host_ifname.c_str());
+    }
+    else
+    {
+        std::printf("请输入上位机 CAN 接口名（如 can4/can5，直接回车=跳过上位机链路）：");
+        if (std::fgets(line, sizeof line, stdin) == nullptr)
+            return -1;
+        chomp(line);
+        host_ifname = line;
+    }
     if (!host_ifname.empty())
     {
         for (int i = 0; i < kLegCount; ++i)
@@ -1529,6 +2034,20 @@ int main()
                 return -1;
             }
         }
+    }
+
+    // 2.5 --dry-run：只校验参数，不打开任何 CAN 设备
+    if (args.dry_run)
+    {
+        std::printf("[dry-run] 参数校验通过，未打开任何 CAN 接口。\n");
+        std::printf("[dry-run] 启用腿：");
+        for (int i = 1; i <= kLegCount; ++i)
+            if (want[i])
+                std::printf("%d ", i);
+        std::printf("；上位机接口：%s\n",
+                    host_ifname.empty() ? "（不启用）" : host_ifname.c_str());
+        printEffectiveConfig(/*verbose=*/true);
+        return 0;
     }
 
     // 3. 初始化各腿（打开 CAN + 电机清错/增益 + 在线探测）
@@ -1675,7 +2194,7 @@ int main()
                     std::printf("  腿%d（%s）：未启用\n", i + 1, l.ifname.c_str());
                     continue;
                 }
-                std::printf("  腿%d（%s）：收帧 %u，丢弃 %u，使能=%s，电机在线",
+                std::printf("  腿%d（%s）：收帧 %u，钳位/丢弃 %u，使能=%s，电机在线",
                             i + 1, l.ifname.c_str(),
                             l.rx_frames.load(), l.dropped.load(),
                             l.armed.load(std::memory_order_relaxed) ? "是" : "否");
