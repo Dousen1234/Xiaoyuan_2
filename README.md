@@ -321,8 +321,8 @@ sudo ip link set can0 down
 > sudo ./build/kcanctl fd can0 1000000 2000000  # 以 CAN FD 模式打开
 > ```
 >
-> ⚠️ **通道默认策略**：本项目**不在**插入 USB 时自动打开任何通道（仓库已删除早期的
-> `deploy/` 自动配置规则）。如果你之前把自动规则装进了系统，请手动清理：
+> ⚠️ **通道默认策略**：本项目**不在**插入 USB 时自动打开任何通道。如果你之前把
+> 自动规则装进了系统，请手动清理：
 >
 > ```bash
 > sudo rm /etc/udev/rules.d/99-kcan-autosetup.rules && sudo udevadm control --reload-rules
