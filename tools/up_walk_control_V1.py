@@ -18,9 +18,20 @@
 帧格式（与钛虎电机写命令帧同构）：
     上位机 → 下位机   ID 1~16, DLC=5  [0x1E][int32 小端 = 关节端角(rad) × 10000]
                      ID 1~16, DLC=1  [0x02]  退出流模式（电机保持，不抱闸）
+                     ID 1~16, DLC=1  [0x03]  清除软限位报警锁定
                      ID 1~16, DLC=1  [0x41]  状态请求 → 下位机立即回该 ID 实际角
     下位机 → 上位机   ID 1~16, DLC=5  [0x41][int32 小端 = 实际关节端角(rad) × 10000]，10Hz
-                     ID 0x161, DLC=1  心跳 200ms（bit0=流模式中，bit1=最近 1s 有样点）
+                     ID 0x161, DLC=1  心跳 200ms（bit0=流模式中，bit1=最近 1s 有样点，
+                                                bit2=软限位报警锁定中）
+                     ID 0x162, DLC=8  软限位报警 200ms（锁定期间重发）
+                                       [0x62][关节ID 1~16][侧别][0][int32=当前实际角]
+                                       侧别：0x01=上限，0x02=下限
+
+软限位保护（下位机行为）：
+    目标越限不再丢弃，而是**钳位到限位值**下发（关节走到限位并停住）；
+    当**实际角**到达限位时，下位机整机锁定并通过 ID 0x162 上报报警，
+    本程序收到后立即停止发送（可加 --keep-on-limit 改为仅告警继续）。
+    解除方式：下位机键盘 clear，或本程序启动新一次回放时自动发 [0x03]。
 
 使用方法（两个终端）：
     终端 A（下位机）：
@@ -58,9 +69,20 @@ import time
 ANGLE_SCALE = 10000.0        # int32 定点标度：协议值 = 关节端角(rad) × 10000
 CMD_SET_POS = 0x1E           # 上位机→下位机：目标位置（DLC=5）
 CMD_STOP = 0x02              # 上位机→下位机：退出流模式（DLC=1）
+CMD_CLEAR_LIMIT = 0x03       # 上位机→下位机：清除软限位报警锁定（DLC=1）
 CMD_GET_STAT = 0x41          # 双向：状态请求（DLC=1）/ 状态反馈（DLC=5）
 HEARTBEAT_ID = 0x161         # 下位机→上位机：心跳帧 ID
 HEARTBEAT_MS = 200           # 下位机心跳周期（ms）
+
+# 软限位报警（下位机→上位机）
+LIMIT_ALARM_ID = 0x162       # 报警帧 ID（避开关节 ID 1~16 与心跳 0x161）
+LIMIT_ALARM_CODE = 0x62      # 报警帧 data[0] 功能码
+LIMIT_ALARM_MS = 200         # 报警帧重发周期（ms）
+LIMIT_SIDE_MAX = 0x01        # data[2]：撞上限
+LIMIT_SIDE_MIN = 0x02        # data[2]：撞下限
+HB_BIT_STREAMING = 0x01      # 心跳 bit0：流模式中
+HB_BIT_SAMPLE_ONLINE = 0x02  # 心跳 bit1：最近 1s 有样点
+HB_BIT_LIMIT_LOCKED = 0x04   # 心跳 bit2：软限位报警锁定中
 
 LEG_COUNT = 4                # 腿数
 JOINT_PER_LEG = 4            # 每腿关节数
@@ -214,8 +236,10 @@ class CanLink(object):
 class LinkMonitor(threading.Thread):
     """
     持续接收下位机帧，解析并缓存：
-      - 心跳 0x161：计数、bit0（流模式中）、bit1（样点在线）、最后到达时刻；
-      - 反馈 ID 1~16 [0x41][int32]：每关节实际角(rad) 与帧计数。
+      - 心跳 0x161：计数、bit0（流模式中）、bit1（样点在线）、bit2（软限位锁定）、
+        最后到达时刻；
+      - 反馈 ID 1~16 [0x41][int32]：每关节实际角(rad) 与帧计数；
+      - 软限位报警 0x162 [0x62][关节ID][侧别][0][int32 实际角]：报警明细与计数。
 
     所有字段用锁保护，主线程随时可读快照（链路检测阶段与回放阶段的实时显示都靠它）。
     """
@@ -229,9 +253,17 @@ class LinkMonitor(threading.Thread):
         self.hb_last_t = 0.0
         self.hb_streaming = False       # bit0
         self.hb_sample_online = False   # bit1
+        self.hb_limit_locked = False    # bit2
         self.fb_rad = [0.0] * TOTAL_JOINTS
         self.fb_count = [0] * TOTAL_JOINTS
         self.fb_last_t = 0.0
+        # —— 软限位报警 ——
+        self.alarm_count = 0            # 收到的 0x162 帧数
+        self.alarm_first_t = 0.0        # 首帧到达时刻（monotonic）
+        self.alarm_jid = 0              # 报警关节 ID（1~16），0 = 尚未报警
+        self.alarm_side = 0             # 0x01=上限，0x02=下限
+        self.alarm_rad = 0.0            # 报警帧里的当前实际角
+        self.alarm_last_t = 0.0         # 最近一帧到达时刻
         self.other_frames = 0           # 非协议帧计数（排查误接总线用）
         self.other_ids = set()
 
@@ -249,9 +281,26 @@ class LinkMonitor(threading.Thread):
                 with self._lock:
                     self.hb_count += 1
                     self.hb_last_t = now
-                    self.hb_streaming = bool(bits & 0x01)
-                    self.hb_sample_online = bool(bits & 0x02)
+                    self.hb_streaming = bool(bits & HB_BIT_STREAMING)
+                    self.hb_sample_online = bool(bits & HB_BIT_SAMPLE_ONLINE)
+                    self.hb_limit_locked = bool(bits & HB_BIT_LIMIT_LOCKED)
                 continue
+
+            # 软限位报警帧（DLC=8）：[0x62][关节ID][侧别][0][int32 实际角]
+            if can_id == LIMIT_ALARM_ID and len(payload) >= 8:
+                if payload[0] == LIMIT_ALARM_CODE:
+                    jid = payload[1]
+                    side = payload[2]
+                    rad = proto_to_rad(unpack_i32le(payload[4:8]))
+                    with self._lock:
+                        if self.alarm_count == 0:
+                            self.alarm_first_t = now
+                        self.alarm_count += 1
+                        self.alarm_jid = jid
+                        self.alarm_side = side
+                        self.alarm_rad = rad
+                        self.alarm_last_t = now
+                    continue
 
             if JOINT_ID_BASE <= can_id < JOINT_ID_BASE + TOTAL_JOINTS:
                 if len(payload) >= 5 and payload[0] == CMD_GET_STAT:
@@ -282,6 +331,16 @@ class LinkMonitor(threading.Thread):
             age = (time.monotonic() - self.hb_last_t) if self.hb_count else float("inf")
             return (self.hb_count, age, self.hb_streaming, self.hb_sample_online,
                     list(self.fb_rad), list(self.fb_count))
+
+    def alarm_snapshot(self):
+        """返回 (报警帧计数, 关节ID, 侧别, 实际角rad)；无报警时关节ID=0。"""
+        with self._lock:
+            return (self.alarm_count, self.alarm_jid, self.alarm_side, self.alarm_rad)
+
+    def limit_locked(self):
+        """下位机是否处于软限位报警锁定（心跳 bit2 / 已收到报警帧）。"""
+        with self._lock:
+            return self.hb_limit_locked or self.alarm_count > 0
 
     def replied_ids(self):
         """已收到过至少一帧反馈的关节 ID 列表。"""
@@ -487,11 +546,14 @@ def load_samples(xlsx_path, sheet=None):
 
 def check_limits(samples, ids):
     """
-    离线限位预检查：扫描将要发送的关节，报告会被下位机丢弃的越限目标。
+    离线限位预检查：扫描将要发送的关节，报告超出下位机软件限位的目标。
 
-    下位机对每个越限帧直接丢弃并计数（该关节保持上一目标），因此若某列长期越限，
-    电机会卡住不动。此处在**上机前**用 JOINT_LIMIT_DEG 提前暴露问题。
-    返回 list[(jid, 关节序号, min_deg, max_deg, 越限点数)]，只含越限的关节。
+    下位机的处理策略是**钳位**：越限目标被改成限位值下发（关节走到限位并停住），
+    随后当**实际角**到达限位时会触发软限位报警（ID 0x162）→ 整机锁定停止接收目标。
+    所以越限本身不会让关节卡在原地不动，但会导致轨迹变形并最终触发报警，
+    此处在**上机前**用 JOINT_LIMIT_DEG 提前暴露问题。
+    返回 list[(jid, 关节序号, min_deg, max_deg, 实际最小deg, 实际最大deg, 越限点数)]，
+    只含越限的关节。
     """
     problems = []
     for jid in ids:
@@ -518,7 +580,7 @@ def check_limits(samples, ids):
 # =============================================================================
 
 def print_link_status(monitor, prefix="      "):
-    """打印一行链路状态摘要（心跳 + 反馈覆盖）。"""
+    """打印一行链路状态摘要（心跳 + 反馈覆盖 + 软限位锁定）。"""
     hb_count, hb_age, streaming, online, fb_rad, fb_count = monitor.snapshot()
     n_fb = sum(1 for c in fb_count if c > 0)
     if hb_count == 0:
@@ -529,6 +591,10 @@ def print_link_status(monitor, prefix="      "):
             "是" if online else "否")
     print("%s%s | 反馈 %d/%d 个 ID 有数据 | 收 %d 帧"
           % (prefix, hb_txt, n_fb, TOTAL_JOINTS, monitor.link.rx_count))
+    alarm_n, alarm_jid, alarm_side, alarm_rad = monitor.alarm_snapshot()
+    if alarm_n > 0:
+        print("%s[软限位锁] 下位机锁定中：%s"
+              % (prefix, describe_limit_alarm(alarm_jid, alarm_side, alarm_rad)))
 
 
 def wait_for_link(monitor, wait_s, quiet=False):
@@ -604,13 +670,19 @@ def print_feedback_table(monitor, ids):
                   % (jid, joint_id_name(jid)))
 
 
-def stream_samples(link, monitor, samples, hz, stop_event, send_ids, progress_s=1.0):
+def stream_samples(link, monitor, samples, hz, stop_event, send_ids, progress_s=1.0,
+                   stop_on_limit=True):
     """
     按 hz 频率回放采样点：每个 tick 给 send_ids 里每个关节发一帧
     [0x1E][int32 = rad × 10000]（DLC=5）。
 
     节拍基于绝对时间轴（t0 + i/hz），避免累积漂移；下位机断流门限 1s，
-    故单次 tick 延迟超过 0.5s 会告警。返回 (已发采样点数, 是否被中断)。
+    故单次 tick 延迟超过 0.5s 会告警。
+
+    stop_on_limit=True 时，一旦收到下位机的软限位报警（0x162）立即停止发送，
+    返回的第三个值为报警信息（无报警为 None）。
+
+    返回 (已发采样点数, 是否被中断, 报警信息或 None)。
     """
     period = 1.0 / hz
     n = len(samples)
@@ -620,7 +692,14 @@ def stream_samples(link, monitor, samples, hz, stop_event, send_ids, progress_s=
 
     for i in range(n):
         if stop_event.is_set():
-            return i, True
+            return i, True, None
+
+        # 软限位报警：下位机已整机锁定，继续发目标毫无意义且会被丢弃
+        if stop_on_limit:
+            alarm_n, alarm_jid, alarm_side, alarm_rad = monitor.alarm_snapshot()
+            if alarm_n > 0:
+                return (i, True,
+                        (alarm_jid, alarm_side, alarm_rad, i, samples.times[i]))
 
         frame = samples.angles[i]
         for jid in send_ids:
@@ -649,13 +728,33 @@ def stream_samples(link, monitor, samples, hz, stop_event, send_ids, progress_s=
                 print("      [警告] tick %d 落后 %.0fms（下位机断流门限 %dms，可能已退出流模式）"
                       % (i + 1, -delay * 1000.0, int(HOST_STREAM_TIMEOUT_S * 1000)))
 
-    return n, False
+    return n, False, None
 
 
 def send_stream_stop(link, ids=None):
     """发 [0x02]（DLC=1）通知下位机退出流模式（电机保持当前目标，不抱闸）。"""
     for jid in (ids or [JOINT_ID_BASE]):
         link.send(jid, bytes([CMD_STOP]))
+
+
+def send_limit_clear(link, ids=None):
+    """发 [0x03]（DLC=1）通知下位机清除软限位报警锁定（整机恢复接收目标）。"""
+    for jid in (ids or [JOINT_ID_BASE]):
+        link.send(jid, bytes([CMD_CLEAR_LIMIT]))
+
+
+def describe_limit_alarm(alarm_jid, alarm_side, alarm_rad):
+    """把报警三元组格式化成可读文本，含限位值与越限量。"""
+    if not (JOINT_ID_BASE <= alarm_jid < JOINT_ID_BASE + TOTAL_JOINTS):
+        return "未知关节 ID %s" % alarm_jid
+    joint = (alarm_jid - JOINT_ID_BASE) % JOINT_PER_LEG + 1
+    lo, hi = JOINT_LIMIT_DEG[joint]
+    side_txt = "上限" if alarm_side == LIMIT_SIDE_MAX else "下限"
+    limit_deg = hi if alarm_side == LIMIT_SIDE_MAX else lo
+    deg = alarm_rad * DEG_PER_RAD
+    return ("ID%-3d %-8s 到达%s %+.1f°（实际 %+.2f°，越限 %+.2f°）"
+            % (alarm_jid, joint_id_name(alarm_jid), side_txt, limit_deg,
+               deg, deg - limit_deg))
 
 
 # =============================================================================
@@ -673,6 +772,7 @@ def build_parser():
   python3 tools/up_walk_control_V1.py --can can4 --auto       # 跳过确认直接发送（脚本化）
   python3 tools/up_walk_control_V1.py --can can4 --only-mapped  # 只发 xlsx 里有的关节，其余不动
   python3 tools/up_walk_control_V1.py --can can4 --loop 0     # 循环回放直到 Ctrl+C
+  python3 tools/up_walk_control_V1.py --can can4 --keep-on-limit  # 触限报警后仍继续发
 """)
     p.add_argument("--can", default="can4",
                    help="上位机 CAN 接口名（须与下位机启动时输入的一致，默认 can4）")
@@ -693,6 +793,9 @@ def build_parser():
                    help="跳过回车确认，链路通了就立即发送（调试脚本化用）")
     p.add_argument("--dry-run", action="store_true",
                    help="不打开 CAN 接口，只解析 xlsx 并模拟发送节拍（无硬件自测）")
+    p.add_argument("--keep-on-limit", action="store_true",
+                   help="收到下位机软限位报警（0x162）后仍继续发送；"
+                        "默认是立即停发（下位机会整机锁定，继续发也会被丢弃）")
     return p
 
 
@@ -756,10 +859,13 @@ def main(argv=None):
               % (TOTAL_JOINTS - len(samples.mapped_ids), UNMAPPED_JOINT_RAD))
         print("             只想动 xlsx 里的关节请加 --only-mapped。")
 
-    # 离线限位预检查：提前暴露会被下位机丢弃的越限目标
+    # 离线限位预检查：提前暴露会被下位机钳位的越限目标
     problems = check_limits(samples, send_ids)
     if problems:
-        print("      [限位警告] 以下关节有目标超出下位机软件限位，会被**逐帧丢弃**（关节卡住不动）：")
+        print("      [限位警告] 以下关节有目标超出下位机软件限位，"
+              "下位机会**钳位到限位值**下发（关节走到限位停住），")
+        print("                 并且当实际角到达限位时触发软限位报警（0x162）"
+              "→ 下位机整机锁定，本程序默认随即停发：")
         for jid, _joint, lo, hi, vmin, vmax, over in problems:
             print("        ID%-3d %s 范围 [%+.1f°, %+.1f°] 超出限位 [%+.0f°, %+.0f°]，%d/%d 点越限"
                   % (jid, joint_id_name(jid), vmin, vmax, lo, hi, over, len(samples)))
@@ -818,6 +924,15 @@ def main(argv=None):
             link.close()
             return 2
 
+        # 清掉上一轮遗留的软限位报警锁定（[0x03]），否则下位机会丢弃所有新目标
+        if monitor.limit_locked():
+            print("      [软限位] 下位机正处于报警锁定，发送 [0x03] 尝试解除 …")
+        send_limit_clear(link, send_ids[:1])
+        time.sleep(0.2)
+        if monitor.limit_locked():
+            print("      [警告] 仍处于锁定状态，可能是报警条件持续满足（关节仍压在限位上）。"
+                  "请先把关节退离限位，或在键盘输入 clear 后重试。")
+
         print("\n      持续监视中（Ctrl+C 退出）。当前链路状态：")
         print_link_status(monitor)
 
@@ -847,6 +962,7 @@ def main(argv=None):
     t_start = time.monotonic()
     total_points = 0
     rounds = 0
+    limit_alarm = None      # 软限位报警信息（收到后按 --keep-on-limit 决定是否继续）
     try:
         while not g_stop.is_set():
             if args.loop and rounds >= args.loop:
@@ -866,9 +982,27 @@ def main(argv=None):
                               % (samples.times[i], i + 1, len(samples)))
                 total_points += len(samples)
             else:
-                sent, interrupted = stream_samples(link, monitor, samples, args.hz,
-                                                   g_stop, send_ids)
+                sent, interrupted, alarm = stream_samples(
+                    link, monitor, samples, args.hz, g_stop, send_ids,
+                    stop_on_limit=not args.keep_on_limit)
                 total_points += sent
+                if alarm is not None:
+                    limit_alarm = alarm
+                    alarm_jid, alarm_side, alarm_rad, idx, t_s = alarm
+                    print("\n" + "!" * 78)
+                    print("[软限位报警] 下位机上报：%s"
+                          % describe_limit_alarm(alarm_jid, alarm_side, alarm_rad))
+                    print("             触发时刻 t=%.2fs（第 %d/%d 点）"
+                          % (t_s, idx + 1, len(samples)))
+                    if args.keep_on_limit:
+                        print("             --keep-on-limit：继续发送（下位机已整机锁定，"
+                              "目标会被丢弃）")
+                    else:
+                        print("             已停止发送（下位机整机锁定，"
+                              "需键盘 clear 或本程序下次启动时发 [0x03] 解除）")
+                    print("!" * 78)
+                    if not args.keep_on_limit:
+                        break
                 if interrupted:
                     break
     finally:
@@ -891,13 +1025,25 @@ def main(argv=None):
         print("       下位机心跳 %d 次（最后 %.0fms 前），流模式=%s，样点在线=%s"
               % (hb_count, hb_age * 1000.0, "是" if streaming else "否",
                  "是" if online else "否"))
+        alarm_n, alarm_jid, alarm_side, alarm_rad = monitor.alarm_snapshot()
+        if alarm_n > 0:
+            print("       软限位报警 %d 帧：%s"
+                  % (alarm_n, describe_limit_alarm(alarm_jid, alarm_side, alarm_rad)))
+            print("       下位机处于报警锁定，解除方式：下位机键盘输入 clear，"
+                  "或重启本程序（启动时自动发 [0x03]）")
+        else:
+            print("       软限位报警：无 ✓")
         print("       收到反馈的关节：%s"
               % (", ".join("ID%d(%d帧)" % (jid, fb_count[jid - JOINT_ID_BASE])
                            for jid in monitor.replied_ids()) or "无"))
         monitor.stop()
     if link:
         link.close()
-    print("[完成] 上位机退出。下位机可继续用键盘命令调试（pos/stat/estop/quit）。")
+    if limit_alarm is not None:
+        print("[完成] 上位机退出（因软限位报警提前结束）。"
+              "下位机仍处报警锁定，需 clear 解除。")
+    else:
+        print("[完成] 上位机退出。下位机可继续用键盘命令调试（pos/stat/estop/quit）。")
     return 0
 
 

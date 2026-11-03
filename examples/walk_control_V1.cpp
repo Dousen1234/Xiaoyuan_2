@@ -18,11 +18,14 @@
  *     [0x1E][int32 小端：目标关节端角 × 10000]（DLC=5）
  *       —— 单关节目标帧，10Hz 周期发送，收到即作为该关节最新目标；
  *     [0x02]（DLC=1）—— 退出流模式，电机保持当前目标；
+ *     [0x03]（DLC=1）—— 清除软限位报警锁定（整机恢复接收目标）；
  *     [0x41]（DLC=1）—— 状态请求，本机立即回该 ID 的实际关节角。
  *   本机 → 上位机：
  *     ID 1~16（DLC=5）[0x41][int32 小端：实际关节端角 × 10000]
  *       —— 10Hz 周期回传（数据源 = 各总线 10Hz 轮询电机 0x41 三合一读）；
- *     ID 0x161（DLC=1）心跳，200ms 周期：bit0=流模式，bit1=样点在线。
+ *     ID 0x161（DLC=1）心跳，200ms 周期：bit0=流模式，bit1=样点在线，
+ *       bit2=软限位报警锁定中；
+ *     ID 0x162（DLC=8）软限位报警，200ms 周期（锁定期间持续重发，见下）。
  *
  *   ID 拆分映射（下位机核心职责）：上位机 ID = (腿号-1)×4 + 关节号，即
  *       ID 1~4   → 腿1（can0）电机 ID 1~4（J1~J4）
@@ -32,17 +35,33 @@
  *     下位机解码后完成 关节端 → 电机输出端 换算（J2/J3 锥齿轮 1:2，×2），
  *     再按钛虎原生协议 [0x1E][int32 编码器 cnt] 经鲲弘 USB-CAN 下发真电机。
  *
- *   保护：目标越限丢弃该帧（该关节保持上一目标）；急停锁定期间丢弃；
- *         流模式 1s 无新样点自动退出（电机保持、不抱闸）；
+ *   保护：目标越限 → 目标被【钳位到限位值】下发（关节走到限位并停住），
+ *         并按实际位置判定是否真的到达限位；一旦到达即触发【软限位报警】：
+ *           · 报警帧 ID 0x162（DLC=8）周期性上报（首次立即发，之后 200ms 重发）；
+ *           · 整机锁定：所有关节目标冻结在锁定瞬间的值，不再接受新目标；
+ *           · 解除方式：上位机发 [0x03]（DLC=1）专用清除命令；
+ *         急停锁定期间丢弃目标；流模式 1s 无新样点自动退出（电机保持、不抱闸）；
  *         estop/quit 抱闸；move/goto 在流模式/急停锁定中暂缓或拒绝。
+ *
+ * 【软限位报警帧 0x162 格式】（DLC=8，标准帧）
+ *   data[0] = 0x62            报警功能码（与 0x41 反馈帧区分）
+ *   data[1] = 关节 ID 1~16    触发报警的关节（全局关节号，即上位机发目标用的 ID）
+ *   data[2] = 方向/侧别       0x01 = 撞上限（max），0x02 = 撞下限（min）
+ *   data[3] = 保留（0）
+ *   data[4..7] = int32 小端   当前实际关节端角 × 10000（每次重发刷新），
+ *                             这样上位机能看出关节是否还在运动
+ *
+ *   限位值本身不必上送：上位机按 ID 换算关节号后本地查表即得（见
+ *   tools/up_walk_control_V1.py 的 JOINT_LIMIT_DEG）。
  *
  * 命令一览（运行后输入，help 可随时查看）：
  *   move <腿1-4> <J1-J4> <cw|ccw> <角度°> [时长s]   相对转动（例：move 1 J1 cw 90）
  *   goto <腿1-4> <J1-J4> <角度°> [时长s]            转到绝对关节角（例：goto 1 J2 45）
  *   pos  [腿1-4]                                     查询关节当前位置（读 10Hz 反馈缓存，不占总线）
- *   stat                                             流模式统计（各腿收帧/丢弃/电机在线）
+ *   stat                                             流模式统计（各腿收帧/丢弃/电机在线/软限位）
  *   estop                                            急停：全部电机立即抱闸并锁定
  *   resume                                           解除急停锁定（电机保持抱闸，等新目标）
+ *   clear                                            清除软限位报警锁定（同上位机 [0x03]）
  *   quit                                             退出（全部电机抱闸后退出）
  *
  * ============================= 单位与符号约定 =============================
@@ -74,8 +93,9 @@
  *   | J2   | P 锥齿轮 1:2 | ±120°           | ±240°            |
  *   | J3   | P 锥齿轮 1:2 | -30° ~ +180°    | -60° ~ +360°     |
  *   | J4   | Y 直驱       | ±90°            | ±90°             |
- *   判定一律按**关节端**进行；上位机目标帧与键盘命令的目标角越界时直接
- *   丢弃/拒绝（不下发任何运动指令）。
+ *   判定一律按**关节端**进行。上位机目标帧越界时**钳位到限位值**后下发（关节
+ *   走到限位并停住），并按实际位置判定是否真的到达限位；键盘 move/goto 的
+ *   目标角越界时仍然直接拒绝（不下发任何运动指令），保持原有调试行为。
  *
  * 减速比说明：kJointGearRatios 只参与**速度**换算（JointModule::velToRadPerS /
  *   radPerSToVel）；位置换算是 radToCnt/cntToRad（262144 cnt = 2π，输出端），
@@ -99,12 +119,14 @@
  *     全部收发——5ms 周期下发目标（0x1E）、10Hz 读实际位置（0x41）写反馈
  *     缓存、执行键盘 move/goto 五次多项式轨迹、急停抱闸；
  *   上位机线程（hostThread）：独占上位机接口，收 ID 1~16 目标帧 → 限位
- *     检查 → 写目标缓存；10Hz 回传实际角；心跳（0x161，200ms）；按需
- *     [0x41] 立即回复；断流 1s 保护。
+ *     检查（越限钳位）→ 写目标缓存；10Hz 回传实际角；心跳（0x161，200ms，
+ *     bit2 上报软限位锁定）；软限位报警帧（0x162）边沿触发 + 200ms 重发；
+ *     按需 [0x41] 立即回复；断流 1s 保护。
  *
  *   线程间只通过无锁原子缓存传递数据（最新值语义，天然适配 10Hz 覆盖式流）：
  *     g_target_rad[腿][关节]  host 线程/总线线程写 → 总线线程读（下发源）
  *     g_fb_rad[腿][关节]      总线线程写 → host 线程/主线程读（回传与 pos 源）
+ *     g_limit_locked 等       总线线程写 → host 线程/主线程读（报警源与部位）
  *
  * 命令执行期间其它关节保持当前目标（每 tick 重发），到位后不抱闸、
  * 由电机内部位置环持续保持（腿不塌）；estop / quit 才发 0x02 抱闸。
@@ -246,9 +268,38 @@ namespace
     constexpr int kStreamTimeoutMs = 1000;
 
     // —— 协议功能码（与钛虎电机协议同码，帧结构同构） ——
-    constexpr uint8_t kHostCmdSetPos = 0x1E; ///< 目标位置（int32 = rad × 10000）
-    constexpr uint8_t kHostCmdStop = 0x02;   ///< 退出流模式（电机保持）
-    constexpr uint8_t kHostCmdGetSt = 0x41;  ///< 状态请求 / 状态回复回显
+    constexpr uint8_t kHostCmdSetPos = 0x1E;     ///< 目标位置（int32 = rad × 10000）
+    constexpr uint8_t kHostCmdStop = 0x02;       ///< 退出流模式（电机保持）
+    constexpr uint8_t kHostCmdClearLimit = 0x03; ///< 清除软限位报警锁定
+    constexpr uint8_t kHostCmdGetSt = 0x41;      ///< 状态请求 / 状态回复回显
+
+    // =====================================================================
+    // 软限位报警（本机 → 上位机）
+    //
+    // 触发条件：实际关节端角到达软限位（按 g_fb_rad 判定，不是按目标判定）——
+    //   只有关节**真的**运动到限位才报警，上位机发出的越限目标本身不直接报警
+    //   （它会被钳位到限位值后下发，关节到位后才触发）。
+    // 触发后：整机锁定（所有关节目标冻结），并每 200ms 重发报警帧，直到
+    //   上位机发 [0x03] 清除。
+    // =====================================================================
+
+    /// 软限位报警帧 ID（0x162，紧跟心跳 0x161；避开关节 ID 1~16 与 0x161）
+    constexpr uint16_t kLimitAlarmId = 0x162;
+    /// 报警帧功能码（data[0]），与 0x41 反馈帧区分
+    constexpr uint8_t kLimitAlarmCode = 0x62;
+    /// 报警帧中「撞哪一侧」的取值（data[2]）
+    constexpr uint8_t kLimitSideMax = 0x01; ///< 撞上限（kJointLimitDeg[j][1]）
+    constexpr uint8_t kLimitSideMin = 0x02; ///< 撞下限（kJointLimitDeg[j][0]）
+    /// 报警帧重发周期（ms）——与心跳同频，锁定期间持续上报
+    constexpr int kLimitAlarmMs = 200;
+
+    /// 限位触发阈值（度）：实际角进入「限位 - 阈值 ~ 限位」区间即判定到达。
+    /// 取值需大于电机 PD 稳态误差（否则永远报不出来），又要足够小以免误报。
+    constexpr double kLimitTriggerDeg = 0.5;
+    /// 限位解除回差（度）：实际角退出「限位 - 回差」以外才认为离开限位。
+    /// 仅在需要「位置回退自动清除」时使用；当前策略是锁定需上位机 [0x03]，
+    /// 此常量用于锁定解除后重新武装（re-arm）的判定，防止抖动反复触发。
+    constexpr double kLimitRearmDeg = 2.0;
 
     // —— 轨迹与执行参数 ——
     constexpr double kDefaultMoveSec = 2.0; ///< 默认轨迹时长 (s)
@@ -400,6 +451,20 @@ namespace
     std::atomic<int64_t> g_stream_last_rx_ms{0}; ///< 最近一次收到样点的时刻（ms，单调钟）
     std::atomic<int64_t> g_host_started_ms{0};   ///< host 链路打开时刻（回传节流起点）
 
+    // —— 软限位报警状态 ——
+    /// 报警锁定：有任一关节到达限位并报警后置位。置位期间所有关节目标冻结
+    /// （不再接受上位机新目标、也不接受新的 move/goto），直到 clearLimitAlarm()
+    /// 被上位机 [0x03] 或键盘 clear 命令解除。
+    std::atomic<bool> g_limit_locked{false};
+    /// 触发报警的关节（全局关节 ID 1~16）；0 = 尚未报警
+    std::atomic<uint16_t> g_limit_alarm_id{0};
+    /// 触发方向：kLimitSideMax / kLimitSideMin；0 = 尚未报警
+    std::atomic<uint8_t> g_limit_alarm_side{0};
+    /// 报警首次触发时刻（ms）——用于理解锁定持续时间
+    std::atomic<int64_t> g_limit_alarm_ms{0};
+    /// 累计报警次数（stat 显示用）
+    std::atomic<uint32_t> g_limit_alarm_count{0};
+
     // =====================================================================
     // 总线线程原语（一条腿的全部 CAN 收发集中在该腿的 busThread）
     // =====================================================================
@@ -494,6 +559,67 @@ namespace
     {
         return joint_deg >= kJointLimitDeg[joint][0] - 1e-9 &&
                joint_deg <= kJointLimitDeg[joint][1] + 1e-9;
+    }
+
+    /// 把关节端角度钳位到该关节的软限位区间内（关节端度），返回钳位后的值。
+    /// 用于上位机越限目标：不再丢弃，而是钳位到限位值下发，让关节走到限位
+    /// 并停住（随后由实际位置判定触发报警）。
+    double clampToLimits(int joint, double joint_deg)
+    {
+        if (joint_deg < kJointLimitDeg[joint][0])
+            return kJointLimitDeg[joint][0];
+        if (joint_deg > kJointLimitDeg[joint][1])
+            return kJointLimitDeg[joint][1];
+        return joint_deg;
+    }
+
+    /// 判定实际关节角是否已到达软限位（关节端度）。
+    /// 到达返回 kLimitSideMax / kLimitSideMin；未到达返回 0。
+    /// 阈值 kLimitTriggerDeg 略向内收缩，避免电机 PD 稳态误差导致永远不触发。
+    uint8_t detectLimitSide(int joint, double joint_deg)
+    {
+        if (joint_deg >= kJointLimitDeg[joint][1] - kLimitTriggerDeg)
+            return kLimitSideMax;
+        if (joint_deg <= kJointLimitDeg[joint][0] + kLimitTriggerDeg)
+            return kLimitSideMin;
+        return 0;
+    }
+
+    /// 触发软限位报警：整机锁定 + 记录报警源（供 host 线程上报）。
+    /// 只在首次触发时打印日志；已在锁定中则忽略（保留首个报警源）。
+    /// 由 busThread 在实际位置到达限位时调用。
+    void triggerLimitAlarm(int leg_idx, int joint_idx, uint8_t side, double joint_deg)
+    {
+        if (g_limit_locked.load(std::memory_order_relaxed))
+            return; // 已锁定：保留首次报警源
+
+        const uint16_t id = jointToId(leg_idx, joint_idx);
+        g_limit_alarm_id.store(id, std::memory_order_relaxed);
+        g_limit_alarm_side.store(side, std::memory_order_relaxed);
+        g_limit_alarm_ms.store(nowMs(), std::memory_order_relaxed);
+        g_limit_alarm_count.fetch_add(1, std::memory_order_relaxed);
+        g_limit_locked.store(true, std::memory_order_relaxed);
+
+        const char *side_txt = (side == kLimitSideMax) ? "上限" : "下限";
+        const int lim_idx = (side == kLimitSideMax) ? 1 : 0;
+        std::printf("\n[软限位][报警] 腿%d %s（全局 ID %u）到达%s %.1f°"
+                    "（实际 %.2f°）→ 整机锁定，等待上位机 [0x03] 清除\n",
+                    leg_idx + 1, kJointNames[joint_idx], id, side_txt,
+                    kJointLimitDeg[joint_idx][lim_idx], joint_deg);
+    }
+
+    /// 清除软限位报警锁定（上位机 [0x03] 或键盘 clear 调用）。
+    /// 只清锁定标志与报警源；各关节保持当前目标（不抱闸、不突变）。
+    void clearLimitAlarm()
+    {
+        if (!g_limit_locked.exchange(false, std::memory_order_relaxed))
+            return;
+        const uint16_t id = g_limit_alarm_id.load(std::memory_order_relaxed);
+        g_limit_alarm_id.store(0, std::memory_order_relaxed);
+        g_limit_alarm_side.store(0, std::memory_order_relaxed);
+        std::printf("[软限位] 报警锁定已清除（原报警关节 ID %u），"
+                    "恢复接收目标（各关节保持当前目标）\n",
+                    id);
     }
 
     /// 执行一条运动命令（Move / Goto）：五次多项式轨迹逐点下发 + 到位确认。
@@ -740,10 +866,22 @@ namespace
                     double vel = 0.0, motor_pos = 0.0;
                     if (leg.motors[j]->readCurrentVelocityPosition(cur_ma, vel, motor_pos))
                     {
-                        leg.fb_rad[j].store(motorToJointRad(j, motor_pos),
-                                            std::memory_order_relaxed);
+                        const double joint_rad = motorToJointRad(j, motor_pos);
+                        leg.fb_rad[j].store(joint_rad, std::memory_order_relaxed);
                         leg.motor_online[j].store(true, std::memory_order_relaxed);
                         offline_streak[j] = 0;
+
+                        // 软限位检测：仅在上位机流模式下判定（手动 move/goto
+                        // 的目标已被限位拒绝，不会走到限位，无需在此判定）。
+                        // 按【实际位置】判定——关节真的运动到限位才报警。
+                        if (g_stream_armed.load(std::memory_order_relaxed) &&
+                            !g_limit_locked.load(std::memory_order_relaxed))
+                        {
+                            const double deg = joint_rad / kDegToRad;
+                            const uint8_t side = detectLimitSide(j, deg);
+                            if (side != 0)
+                                triggerLimitAlarm(leg.index - 1, j, side, deg);
+                        }
                     }
                     else
                     {
@@ -796,6 +934,38 @@ namespace
         sendFeedbackFrame(can, id);
     }
 
+    /// 发送一帧软限位报警（ID 0x162，DLC=8）到上位机。
+    ///
+    /// 帧格式：
+    ///   data[0]    = 0x62           报警功能码
+    ///   data[1]    = 关节 ID 1~16   触发报警的全局关节号
+    ///   data[2]    = 侧别           0x01=上限，0x02=下限
+    ///   data[3]    = 0              保留
+    ///   data[4..7] = int32 小端     当前实际关节端角 × 10000（每次刷新）
+    ///
+    /// 实际角每次重发都重新读取（而非冻结在触发瞬间），上位机据此可判断
+    /// 关节是否仍在运动。限位值不上送：上位机按关节号本地查表即得。
+    void sendLimitAlarmFrame(taihu::SocketCanInterface &can)
+    {
+        const uint16_t jid = g_limit_alarm_id.load(std::memory_order_relaxed);
+        const uint8_t side = g_limit_alarm_side.load(std::memory_order_relaxed);
+        if (!isJointId(jid) || side == 0)
+            return; // 未报警/报警源异常：不发
+
+        const int leg_idx = idToLeg(jid);
+        const int joint_idx = idToJoint(jid);
+        const double rad =
+            g_legs[leg_idx].fb_rad[joint_idx].load(std::memory_order_relaxed);
+
+        uint8_t data[8] = {0};
+        data[0] = kLimitAlarmCode;
+        data[1] = static_cast<uint8_t>(jid);
+        data[2] = side;
+        data[3] = 0;
+        put_i32le(&data[4], radToProto(rad));
+        hostSend(can, kLimitAlarmId, 8, data);
+    }
+
     /// host 线程主函数：独占上位机 CAN 接口，解析 ID 1~16 目标帧并拆分到
     /// 四条腿的目标缓存；10Hz 回传实际关节角；200ms 心跳；断流 1s 保护。
     ///
@@ -803,15 +973,18 @@ namespace
     ///   上位机 → 本机（标准帧，ID = 1~16 = 全局关节号 (腿-1)×4+关节号）：
     ///     [0x1E][int32 小端：目标关节端角(rad) × 10000]  DLC=5，10Hz
     ///     [0x02]   DLC=1：退出流模式（电机保持当前目标）
+    ///     [0x03]   DLC=1：清除软限位报警锁定
     ///     [0x41]   DLC=1：状态请求 → 本机立即回该 ID 实际关节角
     ///   本机 → 上位机：
     ///     ID 1~16（DLC=5）[0x41][int32 小端：实际关节端角 × 10000]，10Hz
-    ///     ID 0x161（DLC=1）200ms 心跳：bit0=流模式，bit1=样点在线
+    ///     ID 0x161（DLC=1）200ms 心跳：bit0=流模式，bit1=样点在线，
+    ///                                   bit2=软限位报警锁定中
+    ///     ID 0x162（DLC=8）200ms 软限位报警（锁定期间持续重发）
     ///
     /// 拆分与保护：
     ///   - ID → (腿, 关节) 由 idToLeg/idToJoint 完成，写入 g_legs[腿].target_rad；
-    ///   - 目标越限（kJointLimitDeg，关节端）→ 丢弃该帧并计数，该关节保持
-    ///     上一目标；急停锁定期间一律丢弃；
+    ///   - 目标越限（kJointLimitDeg，关节端）→ 钳位到限位值后下发并计数
+    ///     （关节走到限位即触发报警）；急停锁定 / 软限位锁定期间一律丢弃；
     ///   - 断流 > 1s → 自动退出流模式（电机保持，不抱闸）。
     void hostThread(const char *ifname)
     {
@@ -822,11 +995,15 @@ namespace
             return;
         }
         std::printf("[协议] 上位机链路就绪：%s（监听关节 ID %u~%u，"
-                    "目标 [0x1E][int32=rad×%.0f]，退出流模式 [0x02]，状态请求 [0x41]）\n",
-                    ifname, kJointIdBase, kJointIdBase + kTotalJoints - 1, kAngleScale);
+                    "目标 [0x1E][int32=rad×%.0f]，退出流模式 [0x02]，"
+                    "清除软限位 [0x03]，状态请求 [0x41]，"
+                    "报警上报 [0x%X]/心跳 [0x%X]）\n",
+                    ifname, kJointIdBase, kJointIdBase + kTotalJoints - 1, kAngleScale,
+                    kLimitAlarmId, kHeartbeatId);
 
         int64_t last_heartbeat_ms = nowMs();
         int64_t last_feedback_ms = nowMs();
+        int64_t last_alarm_ms = 0; ///< 上次发报警帧时刻（0 = 尚未发过）
 
         while (g_running.load())
         {
@@ -856,9 +1033,24 @@ namespace
                     uint8_t d[1];
                     d[0] = static_cast<uint8_t>(
                         (g_stream_armed.load() ? 0x01 : 0x00) |  // bit0：流模式中
-                        (g_stream_online.load() ? 0x02 : 0x00)); // bit1：样点在线
+                        (g_stream_online.load() ? 0x02 : 0x00) | // bit1：样点在线
+                        (g_limit_locked.load() ? 0x04 : 0x00));  // bit2：软限位锁定
                     hostSend(can, kHeartbeatId, 1, d);
                     last_heartbeat_ms = now;
+                }
+
+                // 软限位报警重发（锁定期间 200ms 周期；首次触发立即发一帧）
+                if (g_limit_locked.load())
+                {
+                    if (last_alarm_ms == 0 || now - last_alarm_ms >= kLimitAlarmMs)
+                    {
+                        sendLimitAlarmFrame(can);
+                        last_alarm_ms = now;
+                    }
+                }
+                else
+                {
+                    last_alarm_ms = 0; // 解除后重置，下次触发立即上报
                 }
 
                 // 断流退出：流模式中 1s 无新样点（电机保持当前目标，不抱闸）
@@ -900,6 +1092,13 @@ namespace
                     continue;
                 }
 
+                if (rx.dlc == 1 && rx.data[0] == kHostCmdClearLimit)
+                {
+                    // 清除软限位报警锁定（整机恢复接收目标；电机不抱闸）
+                    clearLimitAlarm();
+                    continue;
+                }
+
                 if (rx.dlc == 1 && rx.data[0] == kHostCmdGetSt)
                 {
                     replyStatusRequest(can, id);
@@ -919,18 +1118,41 @@ namespace
                         leg.dropped.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
-                    // 软件限位检查：越限丢弃该帧（该关节保持上一目标）
-                    if (!withinLimits(joint_idx, rad / kDegToRad))
+                    // 软限位锁定期间一律丢弃（目标已冻结在锁定瞬间的值）
+                    if (g_limit_locked.load())
                     {
                         leg.rx_frames.fetch_add(1, std::memory_order_relaxed);
-                        if (leg.dropped.fetch_add(1, std::memory_order_relaxed) == 0)
-                            std::printf("[流][腿%d][%s][拒绝] 目标 %.2f° 越限"
-                                        "（限位 [%.0f°, %.0f°]），丢弃\n",
-                                        leg.index, kJointNames[joint_idx],
-                                        rad / kDegToRad,
-                                        kJointLimitDeg[joint_idx][0],
-                                        kJointLimitDeg[joint_idx][1]);
+                        leg.dropped.fetch_add(1, std::memory_order_relaxed);
                         continue;
+                    }
+                    // 软件限位检查：越限不再丢弃，而是钳位到限位值后下发
+                    // （关节会走到限位并停住，由实际位置判定触发报警）
+                    {
+                        const double deg = rad / kDegToRad;
+                        if (!withinLimits(joint_idx, deg))
+                        {
+                            const double clamped_deg = clampToLimits(joint_idx, deg);
+                            leg.rx_frames.fetch_add(1, std::memory_order_relaxed);
+                            if (leg.dropped.fetch_add(1, std::memory_order_relaxed) == 0)
+                                std::printf("[流][腿%d][%s][钳位] 目标 %.2f° 越限"
+                                            "（限位 [%.0f°, %.0f°]）→ 钳位到 %.2f°\n",
+                                            leg.index, kJointNames[joint_idx], deg,
+                                            kJointLimitDeg[joint_idx][0],
+                                            kJointLimitDeg[joint_idx][1], clamped_deg);
+                            leg.target_rad[joint_idx].store(
+                                clamped_deg * kDegToRad, std::memory_order_relaxed);
+                            leg.have_target.store(true, std::memory_order_relaxed);
+                            g_stream_online.store(true);
+                            g_stream_last_rx_ms.store(nowMs());
+                            if (!g_stream_armed.load())
+                            {
+                                g_stream_armed.store(true);
+                                std::printf("[流] 收到首帧 0x1E（ID %u = 腿%d %s）："
+                                            "进入流模式\n",
+                                            id, leg_idx + 1, kJointNames[joint_idx]);
+                            }
+                            continue;
+                        }
                     }
                     leg.target_rad[joint_idx].store(rad, std::memory_order_relaxed);
                     leg.have_target.store(true, std::memory_order_relaxed);
@@ -1151,6 +1373,7 @@ namespace
             "  disarm                                          去使能：全部电机抱闸并锁定\n"
             "  estop                                           急停（全部电机抱闸并锁定）\n"
             "  resume                                          解除急停锁定并重新使能（解抱闸）\n"
+            "  clear                                           清除软限位报警锁定（同上位机 [0x03]）\n"
             "  help                                            帮助\n"
             "  quit                                            退出\n"
             "说明：cw=顺时针（负方向），ccw=逆时针（正方向）；默认轨迹时长 %.1fs。\n"
@@ -1158,7 +1381,9 @@ namespace
             "        上电默认去使能，未使能时 0x1E 位置帧不会被执行。启动流程已自动使能。\n"
             "      上位机流：在上位机 CAN 接口上发 ID 1~16 帧 [0x1E][int32=关节端 rad×%.0f]，\n"
             "      ID=(腿-1)×4+关节号，10Hz（协议见 docs/step_protocol.pdf）。\n"
-            "      流模式中 move/goto 暂缓；急停锁定期间上位机目标一律丢弃。\n",
+            "      流模式中 move/goto 暂缓；急停锁定期间上位机目标一律丢弃。\n"
+            "      ★ 软限位保护：越限目标钳位到限位值下发；实际角到达限位时整机锁定并\n"
+            "        以 ID 0x162 上报报警（200ms 重发），需 [0x03] 或 clear 解除。\n",
             kDefaultMoveSec, kAngleScale);
     }
 
@@ -1232,7 +1457,9 @@ int main()
     std::printf("          本机拆分后按钛虎原生协议下发真电机（电机内部 PD 执行）\n");
     std::printf("  角度：按【关节端】计算；ccw（逆时针）= 正，与 xCAN 电机方向一致\n");
     std::printf("  限位：关节端 J1 ±90°，J2 ±120°，J3 -30°~+180°，J4 ±90°\n");
-    std::printf("        （电机端等效：J2 ±240°，J3 -60°~+360°；越限目标丢弃）\n");
+    std::printf("        （电机端等效：J2 ±240°，J3 -60°~+360°）\n");
+    std::printf("  软保护：越限目标钳位到限位值下发；实际角到达限位 → 整机锁定，\n");
+    std::printf("          以 ID 0x162 上报报警（200ms 重发），需 [0x03] 或 clear 解除\n");
     std::printf("  使能：启动时自动解除抱闸（arm 重新使能 / disarm 抱闸）\n");
     std::printf("  例：move 1 J1 cw 90  →  腿1 的 J1 顺时针转 90°（平滑轨迹）\n");
     std::printf("------------------------------------------------------------\n");
@@ -1398,12 +1625,33 @@ int main()
             printHelp();
             continue;
         }
+        if (std::strcmp(line, "clear") == 0)
+        {
+            // 清除软限位报警锁定（与上位机 [0x03] 等价）
+            if (!g_limit_locked.load())
+                std::printf("[软限位] 当前未处于报警锁定，无需清除\n");
+            else
+                clearLimitAlarm();
+            continue;
+        }
         if (std::strcmp(line, "stat") == 0)
         {
-            std::printf("[流状态] 模式=%s 在线=%s 急停锁定=%s\n",
+            std::printf("[流状态] 模式=%s 在线=%s 急停锁定=%s 软限位锁定=%s\n",
                         g_stream_armed.load() ? "流模式" : "空闲",
                         g_stream_online.load() ? "是" : "否",
-                        g_estop_locked.load() ? "是" : "否");
+                        g_estop_locked.load() ? "是" : "否",
+                        g_limit_locked.load() ? "是" : "否");
+            if (g_limit_locked.load())
+            {
+                const uint16_t aid = g_limit_alarm_id.load();
+                const uint8_t aside = g_limit_alarm_side.load();
+                if (isJointId(aid))
+                    std::printf("         报警关节 ID %u（腿%d %s，撞%s），"
+                                "累计报警 %u 次\n",
+                                aid, idToLeg(aid) + 1, kJointNames[idToJoint(aid)],
+                                (aside == kLimitSideMax) ? "上限" : "下限",
+                                g_limit_alarm_count.load());
+            }
             for (int i = 0; i < kLegCount; ++i)
             {
                 const Leg &l = g_legs[i];
@@ -1448,10 +1696,17 @@ int main()
                         g_legs[cmd.leg - 1].ifname.c_str());
             continue;
         }
-        // 急停锁定 / 流模式：主线程即时提示（总线线程同样会拒绝，双保险）
+        // 急停锁定 / 软限位锁定 / 流模式：主线程即时提示（总线线程同样会拒绝，双保险）
         if (g_estop_locked.load())
         {
             std::printf("[腿%d][拒绝] 急停锁定中，move/goto 无效（resume 解除）\n",
+                        cmd.leg);
+            continue;
+        }
+        if (g_limit_locked.load())
+        {
+            std::printf("[腿%d][拒绝] 软限位报警锁定中，move/goto 无效"
+                        "（clear 或上位机 [0x03] 解除）\n",
                         cmd.leg);
             continue;
         }
