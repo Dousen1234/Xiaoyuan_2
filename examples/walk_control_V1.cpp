@@ -760,6 +760,8 @@ namespace
         int64_t last_read_ms = 0;
         int offline_streak[kJointCount] = {0};       ///< 各关节连续读失败次数（退避用）
         int64_t backoff_until_ms[kJointCount] = {0}; ///< 退避截止时刻（跳过读取）
+        bool rearm_ok[kJointCount] = {true, true, true, true}; ///< 各关节已退离限位
+                                                               ///< （防空转复发）
 
         while (g_running.load())
         {
@@ -874,13 +876,26 @@ namespace
                         // 软限位检测：仅在上位机流模式下判定（手动 move/goto
                         // 的目标已被限位拒绝，不会走到限位，无需在此判定）。
                         // 按【实际位置】判定——关节真的运动到限位才报警。
-                        if (g_stream_armed.load(std::memory_order_relaxed) &&
-                            !g_limit_locked.load(std::memory_order_relaxed))
+                        const double deg = joint_rad / kDegToRad;
+
+                        // 防抖：clear 之后关节若仍压在限位上，不立即复发报警，
+                        // 必须先退离限位 kLimitRearmDeg 才重新武装（否则
+                        // clear → 立刻报警 → clear 死循环）。
+                        if (!rearm_ok[j])
                         {
-                            const double deg = joint_rad / kDegToRad;
+                            if (deg <= kJointLimitDeg[j][1] - kLimitRearmDeg &&
+                                deg >= kJointLimitDeg[j][0] + kLimitRearmDeg)
+                                rearm_ok[j] = true; // 已退离，重新武装
+                        }
+                        else if (g_stream_armed.load(std::memory_order_relaxed) &&
+                                 !g_limit_locked.load(std::memory_order_relaxed))
+                        {
                             const uint8_t side = detectLimitSide(j, deg);
                             if (side != 0)
+                            {
                                 triggerLimitAlarm(leg.index - 1, j, side, deg);
+                                rearm_ok[j] = false; // 触限后解除武装
+                            }
                         }
                     }
                     else
