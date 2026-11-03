@@ -2,6 +2,14 @@
 
 本目录提供在 **RK3588 + AGX 嵌入式设备**上配置本项目管理运行环境的脚本与说明。
 
+| 脚本 | 作用 |
+| --- | --- |
+| [`install_env.sh`](install_env.sh) | 一次性配好整套环境（依赖 + 编译 + 驱动安装） |
+| [`install_kcan.sh`](install_kcan.sh) | **只管 kcan 驱动**：安装 / 热重载 / 卸载 / 开机自加载，可反复执行 |
+
+两个脚本**职责分开**：`install_env.sh` 阶段 6 会把驱动安装**转交**给 `install_kcan.sh`，
+不会各自维护一套逻辑。日常驱动排错只跑 `install_kcan.sh` 即可，几秒完成，不碰编译器与依赖。
+
 ---
 
 ## 1. 适用场景
@@ -46,6 +54,12 @@ cd ~/Xiaoyuan_2
 sudo ./deploy/install_env.sh
 ```
 
+### 2.4 只装驱动（已有环境 / 换驱动 / 驱动排错时用这个）
+
+```bash
+sudo ./deploy/install_kcan.sh
+```
+
 ---
 
 ## 3. 脚本做了什么（7 个阶段）
@@ -57,7 +71,7 @@ sudo ./deploy/install_env.sh
 | 3 | 运行时诊断工具 | `can-utils`（candump/cansend）、`iproute2`（**kcanctl 运行时硬依赖**）、`usbutils` |
 | 4 | Python 依赖 | `openpyxl`（上位机唯一硬依赖）；`matplotlib` / `reportlab` / `fontTools` / `pyserial` 只报告不强制 |
 | 5 | 编译项目 | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release` + `cmake --build build -j$(nproc)` |
-| 6 | 安装 kcan 驱动 | **只装 `.ko`，不编译**；校验架构与 `vermagic`，安装到 `/lib/modules/$(uname -r)/misc/` |
+| 6 | 安装 kcan 驱动 | **只装 `.ko`，不编译**；校验架构与 `vermagic`；**转交 `install_kcan.sh` 执行** |
 | 7 | 最终验收 | 检查产物、CAN 接口、`openpyxl`，并打印后续手动操作 |
 
 ---
@@ -71,6 +85,7 @@ sudo ./deploy/install_env.sh [选项]
   --skip-build     跳过阶段 5（只装依赖）
   --skip-driver    跳过阶段 6（不装 kcan 驱动）
   --load-driver    装完驱动后立即 modprobe kcan（默认不加载）
+  --ko <路径>      指定厂商 aarch64 kcan.ko（透传给 install_kcan.sh）
   --check          只做环境自检（不需要 root）
   --dry-run        打印将执行的命令但不执行
   -y, --yes        所有确认自动回答 yes
@@ -119,22 +134,31 @@ kcan 是内核模块，编译需要 `/lib/modules/$(uname -r)/build`（内核头
 
 ### 6.2 把驱动放哪里
 
-脚本按以下顺序查找 `kcan.ko`：
+**推荐：统一放 `deploy/kcan-driver/`**，脚本会优先从这里找。
 
 ```
-deploy/kcan-driver/kcan.ko
-.kunhong_sdk/<任意子目录>/kcan.ko
-kcan-driver/kcan.ko
+deploy/kcan-driver/kcan.ko          ← 必需
+deploy/kcan-driver/kcan.conf        ← 可选（modprobe 参数）
+deploy/kcan-driver/lskcan           ← 可选（厂商工具）
+deploy/kcan-driver/kcan-settings    ← 可选（需为 aarch64）
+deploy/kcan-driver/kcan.h           ← 可选（头文件）
+deploy/kcan-driver/udev/45-kcan.rules ← 可选
 ```
 
-推荐做法：
+该目录下有一份详细说明：[`deploy/kcan-driver/README.md`](kcan-driver/README.md)。
+
+脚本搜索顺序（后者只是兜底，通常是 x86-64 文件会被自动排除）：
+
+```
+1. --ko <路径> 显式指定
+2. deploy/kcan-driver/kcan.ko
+3. kcan-driver/kcan.ko（项目根目录）
+4. .kunhong_sdk/<任意子目录>/kcan.ko  ← 厂商 SDK，基本是 x86-64，仅作发现
+```
 
 ```bash
 mkdir -p deploy/kcan-driver
-# 把厂商给的 ARM64 文件拷进来
 cp /path/to/arm64/kcan.ko deploy/kcan-driver/
-# 可选：一并带上用户态工具
-cp /path/to/kcan.conf /path/to/lskcan /path/to/kcan_monitor deploy/kcan-driver/
 ```
 
 ### 6.3 脚本安装到什么位置
@@ -168,7 +192,106 @@ ip -d link show | grep -E "can[0-9]"
 
 ---
 
-## 7. 安装完成后：手动开 CAN 通道
+## 7. 专用驱动脚本 `install_kcan.sh`
+
+`install_env.sh` 是"一次性配好整套环境"，而 `install_kcan.sh` 只做**驱动生命周期管理**：
+
+- 驱动换版本了 → 重跑一次即可，不碰编译器、不重装依赖，几秒完成
+- 需要开机自加载 → 它负责写 `/etc/modules-load.d/kcan.conf`
+- 需要热重载（改了驱动不重启）→ `--reload`
+- 需要干净卸载 → `--uninstall`
+- 出问题要排查 → `--check` 只读诊断，不需要 root
+
+### 7.1 十个步骤
+
+| 步骤 | 内容 |
+| --- | --- |
+| 1 | 环境检查：root / 架构 / 内核版本 / 发行版 / 内核头文件 / `depmod` `modprobe` / Secure Boot |
+| 2 | 定位 `kcan.ko`（按搜索顺序，自动去重） |
+| 3 | **严格校验**：ELF 架构必须 aarch64；`vermagic` 必须与本机 `uname -r` 一致 |
+| 4 | 安装 `.ko` 到 `/lib/modules/$(uname -r)/misc/` + `depmod -a` + 写 `/etc/modprobe.d/kcan.conf` |
+| 5 | 开机自加载：写 `/etc/modules-load.d/kcan.conf`（内容仅一行 `kcan`） |
+| 6 | 安装厂商用户态工具与头文件（有则装，无则跳过） |
+| 7 | 可选：安装厂商 udev 规则（`--with-udev` 才装） |
+| 8 | 加载模块并验证（`lsmod`、`/sys/module/kcan`、`canN` 接口探测、失败原因对照表） |
+| 9 | 现状总览（模块文件 / 加载状态 / 配置 / 接口） |
+| 10 | 打印后续手动操作 |
+
+### 7.2 命令行选项
+
+```bash
+sudo ./deploy/install_kcan.sh [选项]
+
+  --ko <路径>      指定 kcan.ko（默认自动搜索 deploy/kcan-driver/ 等目录）
+  --reload         安装后热重载模块（会先 down 所有 canN 接口）
+  --uninstall      完整卸载：rmmod + 删除 .ko / 配置 / 工具
+  --no-autoload    不写 /etc/modules-load.d/kcan.conf（即不设开机自加载）
+  --no-tools       不安装厂商用户态工具（lskcan / kcan_monitor 等）
+  --no-headers     不安装厂商头文件（kcan.h / kcanfd.h）
+  --with-udev      安装厂商 udev 规则（/etc/udev/rules.d/45-kcan.rules）
+  --no-load        装完不执行 modprobe（只落盘，不加载）
+  --force          跳过 vermagic 严格校验（内核版本不完全一致时强行安装）
+  --check          只做检查，不修改系统（不需要 root）
+  --dry-run        打印将要执行的命令，但不实际执行
+  -y, --yes        所有确认自动回答 yes
+  -h, --help       显示本帮助
+```
+
+### 7.3 典型用法
+
+```bash
+# ① 第一次装（驱动已放到 deploy/kcan-driver/）
+sudo ./deploy/install_kcan.sh
+
+# ② 先看清楚会改什么，再决定是否执行（不需要 root）
+./deploy/install_kcan.sh --dry-run --check
+
+# ③ 换了新驱动，想立即生效（不重启）
+sudo ./deploy/install_kcan.sh --reload
+
+# ④ 只落盘、暂不加载（等接好线再手动 modprobe）
+sudo ./deploy/install_kcan.sh --no-load
+
+# ⑤ 只要模块，不要开机自加载
+sudo ./deploy/install_kcan.sh --no-autoload
+
+# ⑥ 需要 /dev/kcan-usb_x6/<adapter>/can<N> 这类稳定路径
+sudo ./deploy/install_kcan.sh --with-udev
+
+# ⑦ 出问题只诊断（只读，不改系统）
+./deploy/install_kcan.sh --check
+
+# ⑧ 彻底卸载
+sudo ./deploy/install_kcan.sh --uninstall
+```
+
+### 7.4 退出码
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 全部步骤完成（可能有警告） |
+| `1` | 存在 `[失败]` 项，需按提示逐条处理 |
+
+### 7.5 安全设计
+
+| 行为 | 说明 |
+| --- | --- |
+| **绝不自动 `up` CAN 通道** | 通道编号随 USB 枚举顺序变化，自动开可能对错误通道发 1 Mbps 流量 |
+| `--reload` / `--uninstall` 先 `down` 接口 | `rmmod` 的前置条件，否则 `EBUSY` |
+| 开机自加载只加载模块 | `/etc/modules-load.d/kcan.conf` 仅 `modprobe kcan`，不开通道 |
+| `--dry-run` 不需要 root | 普通用户可完整预览全流程 |
+| `--uninstall` 必须交互确认 | 除非加 `-y` |
+| 覆盖已有 `.ko` 自动备份 | 生成 `kcan.ko.bak.<时间戳>`，卸载时不删备份 |
+
+> **为什么不像 `systemd-networkd` 那样开机自动 `up` 通道？**
+> USB-CAN 适配器的 `canN` 编号会随插入顺序变化（今天 `can4`，明天可能 `can0`）。
+> 自动 `up` 一旦认错通道，就会向一条悬空或错误接线的总线上灌 1 Mbps 流量，
+> 轻则 `No buffer space available`，重则影响整条总线。
+> 因此**通道必须在确认接线后手动打开**。
+
+---
+
+## 8. 安装完成后：手动开 CAN 通道
 
 > **本脚本绝不自动 `up` CAN 通道。** 通道必须按现场接线逐个手动打开。
 
@@ -190,7 +313,7 @@ sudo ./build/kcanctl up can4 1000000
 
 ---
 
-## 8. 验证环境是否可用
+## 9. 验证环境是否可用
 
 ```bash
 # 下位机主程序
@@ -206,7 +329,7 @@ candump can4
 
 ---
 
-## 9. 未覆盖的部分（按需自行安装）
+## 10. 未覆盖的部分（按需自行安装）
 
 | 组件 | 需要时安装 | 说明 |
 | --- | --- | --- |

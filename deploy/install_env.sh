@@ -67,6 +67,7 @@ OPT_DRY_RUN=0
 OPT_CHECK_ONLY=0
 OPT_LOAD_DRIVER=0
 OPT_ASSUME_YES=0
+OPT_KO_PATH=""          # 透传给 install_kcan.sh 的 --ko
 
 # ---------------------------------------------------------------------
 # 输出辅助
@@ -126,6 +127,7 @@ TaiHu_motor_control —— 嵌入式设备（RK3588 / aarch64）环境安装脚�
   --skip-build     跳过阶段 5（编译本项目）
   --skip-driver    跳过阶段 6（安装厂商 kcan 驱动）
   --load-driver    安装驱动后立即 modprobe kcan（默认不加载）
+  --ko <路径>      指定厂商 aarch64 kcan.ko（透传给 deploy/install_kcan.sh）
   --check          只做环境自检，不修改系统（不需要 root）
   --dry-run        打印将要执行的命令，但不实际执行
   -y, --yes        所有确认自动回答 yes
@@ -159,6 +161,9 @@ parse_args() {
             --skip-build)   OPT_SKIP_BUILD=1 ;;
             --skip-driver)  OPT_SKIP_DRIVER=1 ;;
             --load-driver)  OPT_LOAD_DRIVER=1 ;;
+            --ko)           [[ $# -ge 2 ]] || die "--ko 需要一个参数"
+                            OPT_KO_PATH="$2"; shift ;;
+            --ko=*)         OPT_KO_PATH="${1#*=}" ;;
             --check)        OPT_CHECK_ONLY=1 ;;
             --dry-run)      OPT_DRY_RUN=1 ;;
             -y|--yes)       OPT_ASSUME_YES=1 ;;
@@ -646,6 +651,47 @@ phase6_driver() {
         log_skip "按 --skip-driver 跳过"
         return 0
     fi
+
+    # —— 6.0 转交专用脚本 ——
+    # kcan 驱动的安装/卸载/开机自加载已独立成 deploy/install_kcan.sh，
+    # 那里有更严格的架构与 vermagic 校验、可回滚、可重复执行。
+    # 这里只负责转交，避免两处逻辑各自演化后不一致。
+    local kcan_script="${SCRIPT_DIR}/install_kcan.sh"
+    if [[ -x "${kcan_script}" ]]; then
+        log_info "kcan 驱动安装已独立为专用脚本，转交执行"
+
+        local -a kargs=()
+        (( OPT_LOAD_DRIVER )) || kargs+=(--no-load)
+        (( OPT_DRY_RUN ))     && kargs+=(--dry-run)
+        (( OPT_ASSUME_YES ))  && kargs+=(-y)
+        # 透传驱动路径（若用户用过 --ko，虽然 install_env.sh 暂无此选项）
+        [[ -n "${OPT_KO_PATH:-}" ]] && kargs+=(--ko "${OPT_KO_PATH}")
+
+        if (( ${#kargs[@]} > 0 )); then
+            log_info "转交参数     : ${kargs[*]}"
+        fi
+
+        if (( OPT_DRY_RUN )); then
+            log_info "[试运行] ${kcan_script} ${kargs[*]:-}"
+            return 0
+        fi
+
+        if "${kcan_script}" "${kargs[@]}"; then
+            log_ok "驱动安装脚本执行完成（详见上方输出）"
+        else
+            log_warn "驱动安装脚本返回非零，详见上方输出"
+        fi
+        return 0
+    fi
+
+    log_warn "未找到 ${kcan_script}，回退到脚本内置的简化驱动安装逻辑"
+    phase6_driver_legacy
+}
+
+# ---------------------------------------------------------------------
+# 阶段 6 的旧实现（仅在 install_kcan.sh 缺失时作为兜底）
+# ---------------------------------------------------------------------
+phase6_driver_legacy() {
 
     local ko
     if ! ko="$(find_driver_ko)"; then
