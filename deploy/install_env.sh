@@ -681,6 +681,9 @@ phase6_driver() {
         else
             log_warn "驱动安装脚本返回非零，详见上方输出"
         fi
+        log_hint "本项目另有两类接口：USB-RS485（ftdi_sio）、键盘（evdev）"
+        log_hint "以及 dialout / input 用户组和 brltty 抢占排查，本阶段不处理"
+        log_hint "需要一次装齐请单独运行: sudo ./deploy/install_drivers.sh"
         return 0
     fi
 

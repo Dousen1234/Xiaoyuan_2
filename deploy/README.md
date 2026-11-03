@@ -5,10 +5,12 @@
 | 脚本 | 作用 |
 | --- | --- |
 | [`install_env.sh`](install_env.sh) | 一次性配好整套环境（依赖 + 编译 + 驱动安装） |
+| [`install_drivers.sh`](install_drivers.sh) | **只装驱动**：kcan + ftdi_sio + evdev，含用户组与 brltty 排查 |
 | [`install_kcan.sh`](install_kcan.sh) | **只管 kcan 驱动**：安装 / 热重载 / 卸载 / 开机自加载，可反复执行 |
 
-两个脚本**职责分开**：`install_env.sh` 阶段 6 会把驱动安装**转交**给 `install_kcan.sh`，
-不会各自维护一套逻辑。日常驱动排错只跑 `install_kcan.sh` 即可，几秒完成，不碰编译器与依赖。
+三个脚本**职责分开**：`install_env.sh` 阶段 6 会把驱动安装**转交**给 `install_kcan.sh`；
+`install_drivers.sh` 在 `install_kcan.sh` 外面多包了一层，把另两类接口（USB-RS485、键盘）
+和权限问题一并处理。日常驱动排错只跑 `install_drivers.sh` 即可，几秒完成，不碰编译器与依赖。
 
 ---
 
@@ -20,7 +22,7 @@
 | 目标系统 | Debian 系 Linux（有 `apt`），**不要求是 Ubuntu** |
 | 编译方式 | 在板上**本机编译**（不交叉编译） |
 | 网络 | 板上**可能不能上网** → 依赖走离线 `.deb` |
-| kcan 驱动 | 由**厂商提供已编译好的 ARM64 `.ko`**（板上无内核头文件） |
+| kcan 驱动 | 优先**源码编译 + DKMS**；无内核头文件时用厂商 ARM64 `.ko`（见 §6.1） |
 | 图形界面 | 默认不装 Qt5（`taihu_keyboardctl_ui` 自动跳过，不影响其它程序） |
 | ROS 2 | 默认不装（仅 `ros2_ws/` 需要，电机控制主链路不依赖） |
 
@@ -57,7 +59,17 @@ sudo ./deploy/install_env.sh
 ### 2.4 只装驱动（已有环境 / 换驱动 / 驱动排错时用这个）
 
 ```bash
+# 三类驱动一次装齐（含 dialout / input 用户组、brltty 排查）
+sudo ./deploy/install_drivers.sh
+
+# 只要 kcan 一个驱动
 sudo ./deploy/install_kcan.sh
+```
+
+先看一眼会改什么（不需要 sudo）：
+
+```bash
+./deploy/install_drivers.sh --check
 ```
 
 ---
@@ -71,8 +83,7 @@ sudo ./deploy/install_kcan.sh
 | 3 | 运行时诊断工具 | `can-utils`（candump/cansend）、`iproute2`（**kcanctl 运行时硬依赖**）、`usbutils` |
 | 4 | Python 依赖 | `openpyxl`（上位机唯一硬依赖）；`matplotlib` / `reportlab` / `fontTools` / `pyserial` 只报告不强制 |
 | 5 | 编译项目 | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release` + `cmake --build build -j$(nproc)` |
-| 6 | 安装 kcan 驱动 | **只装 `.ko`，不编译**；校验架构与 `vermagic`；**转交 `install_kcan.sh` 执行** |
-| 7 | 最终验收 | 检查产物、CAN 接口、`openpyxl`，并打印后续手动操作 |
+| 6 | 安装 kcan 驱动 | **只装 `.ko`，不编译**；校验架构与 `vermagic`；**转交 `install_kcan.sh` 执行** || 7 | 最终验收 | 检查产物、CAN 接口、`openpyxl`，并打印后续手动操作 |
 
 ---
 
@@ -118,18 +129,50 @@ sudo ./deploy/install_env.sh --skip-deps --skip-build --load-driver
 
 ## 6. kcan 驱动（最关键的一步）
 
-### 6.1 为什么不能自己编译
+### 6.1 三条安装路线，按顺序判断
 
-kcan 是内核模块，编译需要 `/lib/modules/$(uname -r)/build`（内核头文件）。
-你的板子没有内核头文件，因此**必须用厂商提供的、与本机内核版本匹配的 ARM64 `kcan.ko`**。
+厂商 SDK（`KH-UCANFD_Linux_SDK-1.4.2`）**自带完整内核模块源码**（`driver/src/`，50+
+个 `.c/.h`），支持 ARM64 与 2.6–6.x 内核，因此**不是"只能找厂商要预编译件"**。
+实际该走哪条路，取决于板子上有没有内核头文件：
+
+| 情况 | 走哪条路 | 命令 |
+| --- | --- | --- |
+| `/lib/modules/$(uname -r)/build` 存在且是完整 kbuild 树 | **源码编译 + DKMS**（推荐，内核升级自动重编） | `sudo ./deploy/install_drivers.sh` |
+| 头文件不在，但 apt 源里有 `linux-headers-$(uname -r)` | 先装头文件，再源码编译 | 同上，脚本会自动尝试 |
+| 两种情况都不成立 | **用厂商提供的 aarch64 `kcan.ko`** | `sudo ./deploy/install_drivers.sh --ko /path/to/kcan.ko` |
+
+`install_drivers.sh` 的 `--kcan=auto`（默认）就是按上表顺序自动决策的，也可以用
+`--kcan=compile` / `--kcan=prebuilt` / `--kcan=skip` 强制指定。
+
+判断自己的板子属于哪种情况：
+
+```bash
+uname -r                                        # 例如 5.10.160
+ls -d /lib/modules/$(uname -r)/build            # 有则说明头文件在
+apt-cache policy linux-headers-$(uname -r)      # 看 Candidate 是否有版本号
+```
+
+> ⚠️ RK3588 用的多是 Rockchip 厂商内核（如 `5.10.160`），Ubuntu 官方源
+> 通常**不提供**对应头文件。此时 `apt-cache policy` 会显示 `Candidate: (none)`，
+> 属于预期结果，只能走第三条路线。
 
 > ⚠️ 厂商 SDK 压缩包里自带的 `driver/kcan.ko` 是 **x86-64** 预编译件，
-> 在 RK3588 上**无法加载**。必须向厂商索取 aarch64 版本。
+> 在 RK3588 上**无法加载**（`Exec format error`）。
+> `install_drivers.sh` / `install_kcan.sh` 都会做 ELF 架构校验并直接排除它。
 
 脚本会自动检测并明确报错：
 
 ```
 [失败] 该 kcan.ko 不是 aarch64 架构，无法在本机加载！
+```
+
+关于 DKMS：`driver/dkms.conf` 已经配好（`PACKAGE_NAME="kunhong-linux-driver"`，
+`PACKAGE_VERSION="1.4.2"`），`install_drivers.sh` 默认加 `-dkms`，走
+`make install_with_dkms` 分支，效果等同手动执行：
+
+```bash
+cd .kunhong_sdk/KH-UCANFD_Linux_SDK-1.4.2
+sudo make DKMS=DKMS_SUPPORT install -C driver
 ```
 
 ### 6.2 把驱动放哪里
@@ -186,9 +229,144 @@ ip -d link show | grep -E "can[0-9]"
 
 | 报错 | 原因 | 解决 |
 | --- | --- | --- |
-| `invalid module format` | `vermagic` 与内核版本不匹配 | 向厂商索取对应内核版本的 `.ko` |
+| `invalid module format` | `vermagic` 与内核版本不匹配 | 用源码在本机编译，或向厂商索取对应内核版本的 `.ko` |
 | `Key was rejected by service` | Secure Boot 拒绝未签名模块 | 关闭 Secure Boot，或签名模块 |
-| `Exec format error` | `.ko` 架构不对（拿到 x86-64 的了） | 换 aarch64 版本 |
+| `Exec format error` | `.ko` 架构不对（拿到 x86-64 的了） | 换 aarch64 版本，或改用源码编译 |
+
+---
+
+### 6.5 两个必须避开的坑
+
+#### 坑 1：不要用 `build.sh -rules` / `-dkms-rules`
+
+厂商 `build.sh` 的这两个参数会写入 udev 规则：
+
+```
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="kcan", NAME="kcan%n"
+```
+
+它会把 `can0` 改名为 `kcan0`。而本项目里以下程序**全部硬编码了 `can0`**：
+
+| 文件 | 位置 |
+| --- | --- |
+| `examples/taihu_keyboardctl.cpp` | 第 70 行 |
+| `examples/taihu_singleleg_step.cpp` | 第 46 行 |
+| `examples/taihu_single_motorctl.cpp` | 第 24 行 |
+| `examples/taihu_pd_leg.cpp` | 第 452 行 |
+| `tools/taihu_encoder_can_bridge.cpp` | 第 142 行 |
+| `tools/taihu_torque_sensor.cpp` | 第 105 行 |
+| `tools/limit_test.py` | `default="can4"` |
+| `tools/up_walk_control_V1.py` | `default="can4"` |
+
+一旦接口被改名，所有这些程序都会报 `No such device`。
+
+`install_drivers.sh` 的两个对策：
+1. **绝不**传 `-rules` / `-dkms-rules`（编译前还会打印警告说明原因）
+2. 主动扫描 `/etc/udev/rules.d/`，发现已有该规则就报 `[失败]` 并给出删除命令
+
+已误装的清理方式：
+
+```bash
+sudo rm -f /etc/udev/rules.d/45-kcan.rules
+sudo udevadm control --reload-rules
+# 拔插一次 USB-CAN 模块，接口名恢复成 canN
+```
+
+#### 坑 2：SDK 里的 `kcan.ko` 是 x86-64
+
+`.kunhong_sdk/.../driver/kcan.ko` 是厂商在 x86 机器上编的，拷到 RK3588 上
+`modprobe` 会直接报 `Exec format error`。两个安装脚本都会用 ELF 头校验
+（`e_machine == 0xB7`）把它过滤掉，不会误装。
+
+---
+
+### 6.6 一键装齐三类驱动：`install_drivers.sh`
+
+本项目用到**三类**互相独立的硬件接口，`install_kcan.sh` 只覆盖第①类：
+
+| # | 硬件 | 设备节点 | 驱动 | 谁负责 |
+| --- | --- | --- | --- | --- |
+| ① | 鲲弘 KH-UCANFDX6-Mini（4 电机 + 坤维力矩传感器） | `can0`~`can5` | `kcan.ko`（厂商） | `install_kcan.sh` |
+| ② | 金钢 MPT 磁编码器（FT232H/FT2232H 转 RS485，2.5 Mbps） | `/dev/ttyUSB*` | `ftdi_sio`（内核自带） | **本脚本** |
+| ③ | 键盘（`taihu_keyboardctl` 用） | `/dev/input/event*` | `evdev`（内核自带） | **本脚本** |
+
+三者还都需要**用户组权限**：`dialout`（读 `/dev/ttyUSB*`）、`input`（读
+`/dev/input/event*`）；另外 Ubuntu 的 `brltty` 会抢占 USB 串口，需要排查。
+
+`install_drivers.sh` 就是把这些**一次装齐**，同时保留两条安全红线：
+
+- **不会** `ip link set up` 任何 CAN 通道
+- **不会**运行任何 demo / 主程序
+
+#### 快速用法
+
+```bash
+# ① 只读检查（不需要 sudo，不改系统）——建议每次先跑这个
+./deploy/install_drivers.sh --check
+
+# ② 正式安装（自动决策 kcan 走编译还是预编译）
+sudo ./deploy/install_drivers.sh
+
+# ③ 演练一遍，看清楚每个动作再决定
+./deploy/install_drivers.sh --dry-run
+
+# ④ 手上已有 aarch64 的 kcan.ko
+sudo ./deploy/install_drivers.sh --ko /path/to/kcan.ko
+
+# ⑤ 顺带生成 /dev/taihu-rs485 稳定软链（多路 485 时有用）
+sudo ./deploy/install_drivers.sh --with-rs485-symlink
+
+# ⑥ 确认不需要盲文支持，顺手屏蔽 brltty
+sudo ./deploy/install_drivers.sh --fix-brltty
+
+# ⑦ 只装驱动、不碰 kcan（kcan 已单独装好时）
+sudo ./deploy/install_drivers.sh --skip-kcan
+
+# ⑧ 卸载（只删本脚本/install_kcan.sh 装的东西）
+sudo ./deploy/install_drivers.sh --uninstall
+```
+
+#### 十个步骤
+
+| 步骤 | 内容 |
+| --- | --- |
+| 1 | 环境自检：架构 / 内核 / 发行版 / root / 必需工具 / apt |
+| 2 | APT 准备与 DKMS |
+| 3 | 驱动①：`kcan`（自动在编译 / 预编译间决策，并检查 udev 改名规则） |
+| 4 | 驱动②：`ftdi_sio` |
+| 5 | 驱动③：`evdev` |
+| 6 | 用户组：`dialout` + `input`（`usermod -aG`） |
+| 7 | `brltty` 冲突排查（默认只报告，`--fix-brltty` 才处理） |
+| 8 | 设备稳定命名（可选，`--with-rs485-symlink`） |
+| 9 | 状态总览 |
+| 10 | 后续手动操作清单（打开 CAN 通道等，**需自己执行**） |
+
+#### 命令行选项
+
+| 选项 | 说明 |
+| --- | --- |
+| `--check` | 只读检查，不改任何文件，不需要 root |
+| `--dry-run` | 打印将要执行的所有命令，不实际执行，不需要 root |
+| `-y`, `--yes` | 不询问，直接执行 |
+| `--kcan=<auto\|compile\|prebuilt\|skip>` | kcan 安装方式，默认 `auto` |
+| `--ko <路径>` | 显式指定预编译 `kcan.ko`（隐含 `--kcan=prebuilt`） |
+| `--no-dkms` | 不用 DKMS，走普通模块安装 |
+| `--skip-kcan` / `--skip-ftdi` / `--skip-evdev` / `--skip-groups` | 跳过对应部分 |
+| `--with-rs485-symlink` | 生成 `/dev/taihu-rs485` 软链规则 |
+| `--fix-brltty` | 屏蔽 `brltty` 服务（默认只报告不处理） |
+| `--no-apt-update` | 不执行 `apt-get update`（离线环境） |
+| `--uninstall` | 卸载 |
+| `-h`, `--help` | 帮助 |
+
+#### 与另两个脚本的关系
+
+| 脚本 | 定位 | 何时用 |
+| --- | --- | --- |
+| `install_env.sh` | 整套开发/运行环境（编译工具链、Python、运行时工具 + 驱动） | 新板子第一次配 |
+| `install_drivers.sh` | **只装驱动**，三类接口全覆盖 | 换驱动、驱动排错、补装 ftdi/权限 |
+| `install_kcan.sh` | 只管 kcan 一个驱动的落盘/加载/卸载 | 单独换 kcan 版本 |
+
+三者可以叠加使用，重复执行是安全的（都做了幂等检查）。
 
 ---
 
@@ -338,3 +516,6 @@ candump can4
 | `matplotlib` | `sudo apt install python3-matplotlib` | `tools/plot_motor_log.py` 绘图 |
 | `reportlab` + `fontTools` | `pip3 install reportlab fonttools` | 仅重新生成 `docs/step_protocol.pdf` 时需要 |
 | AGX 的 AI 环境 | JetPack / CUDA / TensorRT | 本脚本不涉及，后续单独处理 |
+
+> 三类硬件驱动（kcan / ftdi_sio / evdev）、用户组权限、`brltty` 抢占排查
+> 已全部由 [`install_drivers.sh`](install_drivers.sh) 覆盖，不在上表之列。

@@ -1,6 +1,9 @@
 # kcan 驱动文件放置目录
 
-把**厂商提供的 aarch64 版 `kcan.ko`** 放到本目录，然后执行安装脚本。
+当无法在本机编译时，把**厂商提供的 aarch64 版 `kcan.ko`** 放到本目录，然后执行安装脚本。
+
+> 大多数情况下不需要手动放文件 —— `install_drivers.sh` / `install_kcan.sh` 会
+> 优先尝试用 `.kunhong_sdk/` 里的源码直接编译。只有编译路线走不通时才需要用到本目录。
 
 ## 目录内容
 
@@ -23,7 +26,41 @@ deploy/kcan-driver/
 
 ## 怎么获取 kcan.ko
 
-**必须向厂商索取**，无法自行编译。
+**优先自己编译**（厂商 SDK 自带完整源码），编译不出来再向厂商索取预编译件。
+
+### 路线一：自己编译（推荐）
+
+`.kunhong_sdk/KH-UCANFD_Linux_SDK-1.4.2/` 里有完整的 `driver/src/`（50+ 个 `.c/.h`），
+`driver/Makefile` 支持 ARM64，`driver/dkms.conf` 也已配好。只要板子上有内核头文件就能编：
+
+```bash
+# 先看有没有内核构建树
+ls -d /lib/modules/$(uname -r)/build
+
+# 有的话，交给脚本自动编译安装（默认走 DKMS，内核升级后自动重编）
+sudo ./deploy/install_drivers.sh
+```
+
+脚本内部等价于：
+
+```bash
+cd .kunhong_sdk/KH-UCANFD_Linux_SDK-1.4.2
+sudo ./build.sh -dkms        # 源码编译 + DKMS 注册 + 安装
+```
+
+### 为什么很多时候编不出来
+
+RK3588 板卡上的 Ubuntu 20.04 通常跑**厂商定制内核**（如 `5.10.160`），
+而 Ubuntu 20.04 官方内核是 `5.4.x`，apt 源里没有匹配的 `linux-headers` 包：
+
+```bash
+apt-cache policy linux-headers-$(uname -r)
+# Candidate: (none)      ← 就是这种情况
+```
+
+没有内核头文件就无法编译。此时只能走路线二。
+
+### 路线二：向厂商索取预编译件
 
 | 条件 | 要求 |
 | --- | --- |
@@ -31,17 +68,7 @@ deploy/kcan-driver/
 | 内核版本 | 必须与本机 `uname -r` **完全一致**，例如 `5.10.160` |
 | 编译方式 | 厂商预编译，不是源码 |
 
-### 为什么不能自己编译
-
-`kcan.ko` 是内核模块，编译需要内核构建树：
-
-```
-/lib/modules/$(uname -r)/build/
-```
-
-RK3588 板卡上的 Ubuntu 20.04 通常跑**厂商定制内核**（如 `5.10.160`），
-而 Ubuntu 20.04 官方内核是 `5.4.x`，apt 源里没有匹配的 `linux-headers` 包。
-没有内核头文件就无法编译，所以只能走厂商预编译这条路径。
+> 厂商在 x86 开发机上交叉编译出的 aarch64 版本也可以，只要能提供。
 
 ### ⚠ 厂商 SDK 自带的是 x86-64
 
@@ -82,11 +109,38 @@ uname -r
 
 ```bash
 cd ~/Xiaoyuan_2
+
+# 推荐：自动在「源码编译」和「本目录预编译件」之间决策
+sudo ./deploy/install_drivers.sh
+
+# 或者显式指定用本目录的文件
+sudo ./deploy/install_drivers.sh --kcan=prebuilt
+
+# 只要 kcan 一个驱动
 sudo ./deploy/install_kcan.sh
 ```
 
 脚本会自动在本目录搜索 `kcan.ko` 并完成校验安装。
-详细说明见 [`../README.md`](../README.md) 或 `./deploy/install_kcan.sh --help`。
+详细说明见 [`../README.md`](../README.md) 或 `./deploy/install_drivers.sh --help`。
+
+## ⚠ 不要用 `build.sh -rules` / `-dkms-rules`
+
+厂商 `build.sh` 的这两个参数会写入一条 udev 规则：
+
+```
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="kcan", NAME="kcan%n"
+```
+
+它会把 `can0` 改名成 `kcan0`，而本项目所有程序都硬编码了 `can0`/`can4`，
+改名后全部报 `No such device`。两个安装脚本都**不会**传这两个参数。
+
+如果已经误装：
+
+```bash
+sudo rm -f /etc/udev/rules.d/45-kcan.rules
+sudo udevadm control --reload-rules
+# 拔插一次 USB-CAN 模块，接口名恢复成 canN
+```
 
 ## 文件权限
 
