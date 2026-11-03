@@ -29,3 +29,9 @@ __pycache__/
 
 # 厂家调试资料压缩包（体积过大，不入库）
 /MPT调试资料.zip
+
+# 离线依赖包（体积大且与架构相关，不入库）
+/deploy/offline-debs/*.deb
+
+# 厂商 CAN 驱动二进制（与内核版本强绑定，不入库）
+/deploy/kcan-driver/*.ko
