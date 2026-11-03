@@ -1292,6 +1292,30 @@ python3 tools/up_walk_control_V1.py --can can4
 - **限位（关节端）**：J1 ±90°、J2 ±120°、J3 **−30°~+180°**、J4 ±90°（电机端等效 J2 ±240°、J3 −60°~+360°）。脚本在 `[1/4]` 阶段就逐关节报越限点数——下位机对越限帧是**逐帧丢弃**的，关节会直接卡住不动，所以务必先看这条提示。
 - **相邻采样点跳变**：脚本会算最大关节变化并打印。超过 **0.035 rad（≈2°/帧）** 会提示——不是错误，但电机 PD 追踪会滞后，建议插值加密或降低 `--hz` 来放宽。
 
+**现有轨迹文件**
+
+| 文件 | 点数 / 时长 | 表 | 说明 |
+|------|------------|----|------|
+| `step_position/step_make.xlsx` | 201 点 @0.1s / 20.0s | `Joint samples` | 标准格式原始样例，仅腿 1、腿 2 的 J2/J3 有数据 |
+| `step_position/step_make_V2.xlsx` | 768 点 @0.1s / 76.7s | `Joint samples` | 由 YPPY 轨迹转换而来：10s 起站立过渡 + 循环步态；J1 已饱和裁剪到 ±90° |
+
+**从 YPPY 轨迹转换**
+
+`step_position/YPPY_joint_trajectories_0p1s_with_10s_transition.xlsx` 是上游生成的 YPPY 命名轨迹（表 `Angles_rad` / `Angles_deg`，表头 `Time_s | LF_Y1_rad … RR_Y4_rad`），**不能直接喂给上位机**（表头认不出、J1 峰值 ±139° 超过 ±90° 限位）。用转换脚本处理：
+
+```bash
+python3 tools/convert_yppy_to_step_make.py            # 默认生成 step_position/step_make_V2.xlsx
+python3 tools/convert_yppy_to_step_make.py --src <源文件> --dst <输出文件> --sheet Angles_rad
+```
+
+转换做三件事，并打印「每列裁剪点数 + 限位核对表」：
+
+1. **改表头**：`LF/RF/LR/RR + Y1/P2/P3/Y4` → `L{腿}_J{关节}`，腿序按现场接线 **LF→L1、RF→L2、LR→L3、RR→L4**（`LEG_MAP` 可改）。
+2. **单位统一**：只读 `Angles_rad` 表；`Angles_deg` 表会被拒绝（当成 rad 用会放大 57 倍）。
+3. **J1 限位饱和裁剪**：超出 ±90° 的点削平到 ±90°（源轨迹 Y1 峰值到 ±139.19°，不裁剪的话下位机会逐帧丢弃，J1 在 t≈11s 后一直卡在限位上）。裁剪点数会逐列打印，例如 `L1_J1 498 点`。
+
+> ⚠️ 裁剪后 J1 会**贴身贴在 ±90° 限位上**约 65% 的时间——这是为了让轨迹能跑起来的折中方案，姿态与原设计不同。如果机械真的允许更大偏航，应改 `examples/walk_control_V1.cpp` 的 `kJointLimitDeg[0]`、`tools/up_walk_control_V1.py` 的 `JOINT_LIMIT_DEG[1]` 与本脚本三处，而不是依赖裁剪。
+
 ### 6. 四阶段运行流程
 
 | 阶段 | 动作 | 失败时 |
@@ -1313,6 +1337,9 @@ python3 tools/up_walk_control_V1.py --dry-run
 
 # ② 标准联调（先握手，人工确认后回放一遍）
 python3 tools/up_walk_control_V1.py --can can4
+
+# ②' 回放 YPPY 转换来的 76.7s 站立+步态轨迹
+python3 tools/up_walk_control_V1.py --can can4 --xlsx step_position/step_make_V2.xlsx
 
 # ③ 只发已经写进 xlsx 的关节（未写列的关节不发，避免被拉回零位）
 python3 tools/up_walk_control_V1.py --can can4 --only-mapped
