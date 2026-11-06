@@ -119,6 +119,52 @@ if (encoder.readPositionStatus(sample)) {
 
 协议参考：[MPT 磁编码器数据手册 v0.6](manuals/MPT磁编码器数据手册v0.6.pdf)。
 
+## 轨迹打包（trajectory_pack）
+
+头文件：`taihu/trajectory_pack.h`，实现：`src/trajectory_pack.cpp`（已编入 `taihu_core`）。
+
+只做一件事：**输入一段 16 关节轨迹，输出对应的 16-ID CAN 指令帧**。不打开设备、
+不发送、不接收、不检查限位，纯计算、无状态、线程安全。发送节奏完全由调用方决定。
+
+```cpp
+#include "taihu/trajectory_pack.h"
+
+std::vector<taihu::TrajectoryPoint> traj;   // 你的轨迹
+// traj[i].t    采样时刻（秒）
+// traj[i].pose 16 个关节端弧度，pose[0] 对应 CAN ID 1
+
+std::vector<taihu::TimedFrame> frames = taihu::packTrajectory(traj);
+
+for (const auto& tf : frames) {
+    can.send(tf.frame);                     // 用你已有的 CAN 接口发出去
+}
+```
+
+主要 API：
+
+| 接口 | 说明 |
+|---|---|
+| `packTrajectory(traj)` | **主入口**。N 个采样点 → 最多 N×16 帧，扁平数组，每帧附带所属采样点时刻 `t` |
+| `packPose(pose)` | 单个姿态 → 16 帧（`CanFrame` 列表，不含时间戳） |
+| `encodeAngle(rad)` / `decodeAngle(raw)` | 弧度 ↔ 协议定点值（×10000），纯函数可单测 |
+| `isFinitePose(pose)` | 检查 16 个角是否都是有限值 |
+| `jointId(leg, joint)` / `idToLeg(id)` / `idToJoint(id)` | ID 与腿/关节映射，`constexpr` |
+| `JointPose` / `TrajectoryPoint` / `TimedFrame` | `std::array<double,16>` / `{t, pose}` / `{t, CanFrame}` |
+
+协议：标准帧，`DLC=5`，`data[0]=0x1E`，`data[1..4]` 为 `int32 小端 = 关节端弧度 × 10000`；
+ID = `腿号×4 + 关节号 + 1`，取值 1~16。
+
+> ⚠️ **输入单位是关节端弧度，本库不做任何换算。** 与 `taihu_singleleg_step_xCAN`
+> （电机输出端**度**）不同，J2/J3 上有 1:2 锥齿轮，两者差 2 倍，不要混用。
+
+某个关节角是 `NaN`/`Inf` 时，只跳过该关节的帧（不会用 0 顶替），因此返回长度可能
+小于 N×16。
+
+轨迹播完如需退出下位机流模式，自行组一帧 `[0x02]` 发出。
+
+可运行示例：`examples/trajectory_pack_demo.cpp`（`./build/trajectory_pack_demo`），
+不打开任何硬件，打印帧内容并做字节级核对。
+
 ## 日志与公共配置
 
 - `taihu/motor_logger.h`：`MotorLogger(filename)` 以覆盖模式创建 CSV；按顺序调用 `writeHeader(motor_ids)` 和 `log(timestamp_s, motors)`，其中 `motors` 顺序必须与表头 ID 顺序一致；可用 `isOpen()` 检查和 `close()` 关闭。

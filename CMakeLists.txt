@@ -15,10 +15,17 @@ add_library(taihu_core STATIC
     src/motor_logger.cpp      # 实时日志记录
     src/torque_sensor.cpp     # 坤维扭矩传感器（HIT-V2.0，可与电机共总线）
     src/mpt_encoder.cpp       # 金钢 MPT 磁编码器（RS485，独立于 CAN 总线）
+    src/trajectory_pack.cpp   # 轨迹打包：16 关节轨迹 → 16-ID CAN 帧（纯计算，无 IO）
 )
 target_include_directories(taihu_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# std::thread / std::mutex 需要 pthread。glibc 2.34 之前 libpthread 未并入 libc，
+# 必须显式链接（RK3588 板端是 glibc 2.31，漏掉会出现 undefined reference to pthread_create）。
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(taihu_core PUBLIC Threads::Threads)
 
 # =====================================================================
 # 可执行目标（自动链接核心库）
@@ -40,6 +47,9 @@ taihu_add_executable(taihu_pd_leg examples/taihu_pd_leg.cpp)
 
 # 四腿机器人关节级命令控制（语义命令 → 限位 → 平滑轨迹 → 到位确认）
 taihu_add_executable(walk_control_V1 examples/walk_control_V1.cpp)
+
+# 轨迹打包示例：把一段 16 关节轨迹转成 CAN 帧并打印出来（不打开硬件）
+taihu_add_executable(trajectory_pack_demo examples/trajectory_pack_demo.cpp)
 
 # —— 工具程序 ——
 # taihu_motor_tools：菜单式工具总入口（扫描/诊断/改ID/恢复出厂/标零/开刹车/低压阈值）
