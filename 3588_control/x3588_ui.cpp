@@ -590,6 +590,11 @@ private:
     void setLabelState(QLabel *l, const QString &text, const char *color);
     void updateProcessButtons();
 
+    /// 查询网卡的物理拓扑描述（USB 路径 / PCI 槽位 / platform 设备）。
+    /// kcan 驱动按枚举顺序抢空位命名，接口名（can0~can5）与物理插口并不
+    /// 一一对应，界面上必须把这层信息显式暴露出来，否则用户会误判。
+    QString queryInterfacePhysPath(const QString &ifname) const;
+
     // ---- CAN 接口配置行 ----
     struct IfRow
     {
@@ -597,6 +602,7 @@ private:
         QCheckBox *en = nullptr;
         QSpinBox *rate = nullptr;
         QLabel *state = nullptr;
+        QLabel *phys = nullptr;  ///< 物理端口 / 驱动信息（如 USB 2-1.4.2.5）
     };
     std::vector<IfRow> m_ifRows;
 
@@ -649,6 +655,7 @@ private:
 
     QPushButton *m_btnMonitor = nullptr;
     QPushButton *m_btnEstop = nullptr;
+    QPushButton *m_btnClearLimit = nullptr; ///< 清除软限位报警（仅报警时可用）
 
     // 关节限位（关节端，度）——与 lower_control 默认值严格一致
     static const double kLimDeg[kJointCount][2];
@@ -657,7 +664,7 @@ private:
 const double MainWindow::kLimDeg[kJointCount][2] = {
     {-120.0, 120.0}, // J1 Y  直驱
     {-120.0, 120.0}, // J2 P1 锥齿轮 1:2
-    {-30.0, 180.0},  // J3 P2 锥齿轮 1:2（不对称）
+    {-60.0, 180.0},  // J3 P2 锥齿轮 1:2（不对称）
     {-90.0, 90.0},   // J4 Y  直驱
 };
 
@@ -913,6 +920,27 @@ QWidget *MainWindow::buildTopBar()
     m_alarmLabel = new QLabel("软限位：正常");
     setLabelState(m_alarmLabel, "软限位：正常", kCssGreen);
 
+    // ---- 清限位：紧跟在软限位状态标签后面，方便报警时一键清除 ----
+    m_btnClearLimit = new QPushButton("清限位");
+    m_btnClearLimit->setMinimumSize(96, 40);
+    m_btnClearLimit->setStyleSheet(
+        "QPushButton{background:#ef6c00;color:white;font-weight:bold;"
+        "font-size:14px;border-radius:4px;}"
+        "QPushButton:hover{background:#fb8c00;}"
+        "QPushButton:pressed{background:#e65100;}"
+        "QPushButton:disabled{background:#bdbdbd;color:#757575;}");
+    m_btnClearLimit->setToolTip(
+        "清除下位机软限位报警锁定：\n"
+        "  · 向下位机终端写入 clear 命令\n"
+        "  · 向 can5 广播 0x03（DLC=1）\n\n"
+        "注意：清除后，触限关节必须退回限位内 ≥2.0°\n"
+        "才会重新允许接收目标角（回滞保护）。\n\n"
+        "该按钮仅在检测到下位机软限位锁定时亮起可用；\n"
+        "未打开 CAN 监控时无法得知报警状态，故保持置灰。");
+    m_btnClearLimit->setEnabled(false);
+    connect(m_btnClearLimit, &QPushButton::clicked, this,
+            &MainWindow::onClearLimitAlarm);
+
     m_btnEstop = new QPushButton("急  停");
     m_btnEstop->setMinimumSize(120, 40);
     m_btnEstop->setStyleSheet(
@@ -932,6 +960,7 @@ QWidget *MainWindow::buildTopBar()
     lay->addWidget(m_btnMonitor);
     lay->addWidget(m_heartbeatLabel);
     lay->addWidget(m_alarmLabel);
+    lay->addWidget(m_btnClearLimit);
     lay->addStretch(1);
     lay->addWidget(m_btnEstop);
     return box;
@@ -949,8 +978,14 @@ QWidget *MainWindow::buildCanConfigBox()
 
     auto *hint = new QLabel(
         "勾选要拉起的通道，改好波特率后点【应用】。"
-        "配置动作 = ip link set &lt;通道&gt; down → type can bitrate N → up。");
+        "配置动作 = ip link set &lt;通道&gt; down → type can bitrate N → up。<br>"
+        "<b>注意：</b>【物理端口】列显示该接口名实际绑定的 USB 插口。"
+        "kcan 驱动是\"抢空位\"式命名，接口名不一定等于物理口序号 —— "
+        "例如当前机器上 <b>can0 实际是第 5 个口</b>。"
+        "若映射与丝印不符，请运行 <span style=\"font-family:monospace\">"
+        "deploy/install_kcan_persistent_name.sh</span> 固定命名。");
     hint->setWordWrap(true);
+    hint->setTextFormat(Qt::RichText);
     hint->setStyleSheet("color:#555;font-size:12px;");
     lay->addWidget(hint);
 
@@ -959,8 +994,9 @@ QWidget *MainWindow::buildCanConfigBox()
     grid->setVerticalSpacing(8);
 
     // 表头
-    const char *heads[] = {"启用", "通道", "波特率 (bit/s)", "当前状态"};
-    for (int c = 0; c < 4; ++c)
+    const char *heads[] = {"启用", "通道", "物理端口", "波特率 (bit/s)",
+                           "当前状态"};
+    for (int c = 0; c < 5; ++c)
     {
         auto *h = new QLabel(heads[c]);
         QFont f = h->font();
@@ -1019,6 +1055,28 @@ QWidget *MainWindow::buildCanConfigBox()
         // 【状态】列留够宽度，防止【UP 990000】这种文本被挤断行
         r.state->setMinimumWidth(104);
 
+        // 勾选框的提示：把即将执行的完整命令写清楚，
+        // 避免用户以为"勾 can0 就是开第 1 个物理口"。
+        r.en->setToolTip(
+            QString("勾选后执行：\n"
+                    "  ip link set %1 down\n"
+                    "  ip link set %1 type can bitrate <波特率>\n"
+                    "  ip link set %1 up\n\n"
+                    "注意：%1 是接口名，不等同于物理插口序号，"
+                    "请对照左侧【物理端口】列。")
+                .arg(n));
+
+        // 【物理端口】列：启动时先占位，onRefreshBusStatus() 会填入真实信息
+        r.phys = new QLabel("—");
+        {
+            QFont pf = r.phys->font();
+            pf.setFamily("monospace");
+            pf.setPointSize(11);
+            r.phys->setFont(pf);
+        }
+        r.phys->setStyleSheet(QString("color:%1;").arg(kCssGray));
+        r.phys->setMinimumWidth(140);
+
         grid->addWidget(r.en, row, 0, Qt::AlignCenter);
         auto *nameLab = new QLabel(n);
         QFont nf = nameLab->font();
@@ -1028,14 +1086,15 @@ QWidget *MainWindow::buildCanConfigBox()
         nameLab->setFont(nf);
         nameLab->setMinimumWidth(72);
         grid->addWidget(nameLab, row, 1);
-        grid->addWidget(r.rate, row, 2);
-        grid->addWidget(r.state, row, 3);
+        grid->addWidget(r.phys, row, 2);
+        grid->addWidget(r.rate, row, 3);
+        grid->addWidget(r.state, row, 4);
 
         m_ifRows.push_back(r);
         ++row;
     }
 
-    grid->setColumnStretch(3, 1);
+    grid->setColumnStretch(4, 1);
     lay->addLayout(grid);
 
     auto *btnRow = new QHBoxLayout();
@@ -1534,6 +1593,73 @@ bool MainWindow::runSync(const QString &prog, const QStringList &args, QString *
 // =============================================================================
 // CAN 接口配置
 // =============================================================================
+QString MainWindow::queryInterfacePhysPath(const QString &ifname) const
+{
+    // -------------------------------------------------------------------
+    // 目的：把一个接口名翻译成"它到底插在哪个物理位置"。
+    //
+    // 为什么需要这个：kcan 驱动注册 netdevice 时是"抢空位"式命名 ——
+    // 内核给什么名字用什么名字，不看物理端口号。RK3588 板载 CAN 先枚举
+    // 抢走 can0，随后被 udev 改名成 can_mcu 让出 can0；接着枚举的 USB
+    // 第 5 个口恰好捡到 can0。于是 can0 ≠ 第 1 个物理口，而且每次开机
+    // 都可能变。上层看到 "can0" 根本不知道是哪根线。
+    //
+    // 实现：直接读 sysfs，不依赖 udevadm，也不需要 root。
+    //   /sys/class/net/<if>/device  是真实设备节点的符号链接，
+    //   把它解析成绝对路径后从中提取 USB 端口号（形如 2-1.4.2.5）
+    //   或 platform 设备名（形如 fea60000.can）。
+    // -------------------------------------------------------------------
+    const QString devLink = QString("/sys/class/net/%1/device").arg(ifname);
+    QFileInfo fi(devLink);
+
+    if (!fi.exists())
+        return QString(); // 接口不存在
+
+    // canonicalFilePath 会解析掉所有符号链接，拿到 /sys/devices/... 真路径
+    QString real = fi.canonicalFilePath();
+    if (real.isEmpty())
+        real = fi.symLinkTarget();
+
+    if (real.isEmpty())
+        return QString();
+
+    // --- 情况 1：USB 适配器，路径里有 usbN/A-B.C.D.../A-B.C.D...:1.0 ---
+    // 我们想要的是拓扑里最后一段形如 2-1.4.2.5 的端口串，
+    // 它对应适配器外壳上的物理插口序号。
+    QRegularExpression reUsb("(\\d+-\\d+(?:\\.\\d+)*):\\d+\\.\\d+");
+    auto mUsb = reUsb.match(real);
+    if (mUsb.hasMatch())
+    {
+        const QString port = mUsb.captured(1); // 例如 2-1.4.2.5
+        // 末段数字即物理插口序号，单独标出来方便用户对丝印
+        QRegularExpression reLast("\\.(\\d+)$");
+        auto mLast = reLast.match(port);
+        if (mLast.hasMatch())
+            return QString("USB %1 (插口%2)").arg(port).arg(mLast.captured(1));
+        return QString("USB %1").arg(port);
+    }
+
+    // --- 情况 2：板载 / platform 设备，路径形如 .../fea60000.can ---
+    QRegularExpression rePlat("(0x)?([0-9a-fA-F]{6,8}\\.\\w+)");
+    auto mPlat = rePlat.match(real);
+    if (mPlat.hasMatch())
+        return QString("板载 %1").arg(mPlat.captured(1) + mPlat.captured(2));
+
+    // --- 情况 3：其它（PCI 网卡等），把路径末两段拼一下当标识 ---
+    // 注意：Qt 5.12 没有 Qt::SkipEmptyParts（5.14 才引入），
+    // 这里手工剔除空串，兼容 3588 上的 Qt 5.12.8。
+    QStringList parts;
+    for (const QString &seg : real.split('/'))
+    {
+        if (!seg.isEmpty())
+            parts.append(seg);
+    }
+    if (parts.size() >= 2)
+        return parts.at(parts.size() - 2) + "/" + parts.last();
+
+    return QString();
+}
+
 void MainWindow::onApplyCanConfig()
 {
     if (!isRoot())
@@ -1560,6 +1686,15 @@ void MainWindow::onApplyCanConfig()
 
         QString out;
         bool good = false;
+
+        // 把"接口名 → 物理端口"一并写进日志。
+        // 这是排查"勾了 can0 却像是动了别的口"这类问题的关键线索：
+        // 接口名本身并不等于物理插口序号（kcan 抢空位命名）。
+        const QString phys = queryInterfacePhysPath(ifname);
+        logSys(QString("配置 %1（物理端口：%2）@ %3 bit/s …")
+                   .arg(ifname)
+                   .arg(phys.isEmpty() ? QString("未知") : phys)
+                   .arg(bitrate));
 
         // 优先用自带的 kcanctl（行为与文档一致）
         const QString kc = findKcanctl();
@@ -1736,6 +1871,22 @@ void MainWindow::onRefreshBusStatus()
     // ---- 更新接口配置行里的状态标签 ----
     for (const IfRow &r : m_ifRows)
     {
+        // 物理端口列：与状态无关，只要接口存在就显示，方便核对丝印
+        if (r.phys)
+        {
+            const QString phys = queryInterfacePhysPath(r.name);
+            if (phys.isEmpty())
+            {
+                r.phys->setText("—");
+                r.phys->setStyleSheet(QString("color:%1;").arg(kCssGray));
+            }
+            else
+            {
+                r.phys->setText(phys);
+                r.phys->setStyleSheet(QString("color:%1;").arg(kCssBlue));
+            }
+        }
+
         auto it = infos.find(r.name);
         if (it == infos.end() || !it->second.found)
         {
@@ -2194,14 +2345,36 @@ void MainWindow::onEstop()
 
 void MainWindow::onClearLimitAlarm()
 {
-    // 两条路：下位机的 clear 命令 + 总线上广播 0x03
-    if (m_lower->state() == QProcess::Running)
+    // 两条路并行，互为兜底：
+    //   ① 向下位机（lower_control）stdin 写 clear —— 清下位机内部 g_limit_locked
+    //   ② 在 can5 上广播 0x03 —— 让下位机即使没收到 stdin 也能通过总线清除
+    bool did = false;
+    QStringList done;
+
+    if (m_lower && m_lower->state() == QProcess::Running)
+    {
         m_lower->write("clear\n");
+        done << "下位机 clear";
+        did = true;
+    }
 
     if (m_mon && m_mon->isOpen())
+    {
         m_mon->requestClearLimit();
+        done << "CAN 广播 0x03";
+        did = true;
+    }
 
-    logSys("已发送清除软限位报警（clear + 0x03 广播）");
+    if (!did)
+    {
+        logSys("✗ 清除软限位失败：下位机未运行且 CAN 监控未打开，无可用通道");
+        statusBar()->showMessage("清除软限位失败：无可用通道", 5000);
+        return;
+    }
+
+    logSys(QString("已发送清除软限位报警（%1）").arg(done.join(" + ")));
+    logSys("提示：触限关节需退回限位内 ≥2.0° 才会重新接收目标角");
+    statusBar()->showMessage("已发送清除软限位报警", 5000);
 }
 
 void MainWindow::onMonitorToggle(bool on)
@@ -2311,6 +2484,28 @@ void MainWindow::tickProcesses()
         {
             setLabelState(m_alarmLabel, "软限位：正常", kCssGreen);
         }
+
+        // ---- 清限位按钮：仅在下位机报软限位锁定时可点 ----
+        // 避免无报警时误触；同时报警时高亮提醒操作员处理。
+        if (m_btnClearLimit)
+        {
+            const bool locked = m_mon->limitLocked();
+            m_btnClearLimit->setEnabled(locked);
+            m_btnClearLimit->setStyleSheet(
+                locked
+                    ? QString("QPushButton{background:#ef6c00;color:white;"
+                              "font-weight:bold;font-size:14px;border-radius:4px;"
+                              "border:2px solid #ff1744;}"
+                              "QPushButton:hover{background:#fb8c00;}"
+                              "QPushButton:pressed{background:#e65100;}")
+                    : QString("QPushButton{background:#bdbdbd;color:#757575;"
+                              "font-weight:bold;font-size:14px;border-radius:4px;}"));
+        }
+    }
+    else if (m_btnClearLimit)
+    {
+        // 监控未开：无从得知报警状态，置灰
+        m_btnClearLimit->setEnabled(false);
     }
 }
 

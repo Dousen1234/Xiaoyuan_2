@@ -1,0 +1,8 @@
+# 鲲弘 KCAN-USB FD —— 物理端口 2-1.4.2.6 固定为 can5
+# 详见 60-kcan-persistent-name.link 里的完整说明。
+# 目的：消除 kcan 驱动"抢空位"命名导致的 canN 与物理口错位/漂移。
+[Match]
+Path=platform-fc880000.usb-usb-0:1.4.2.6:1.0
+
+[Link]
+Name=can5

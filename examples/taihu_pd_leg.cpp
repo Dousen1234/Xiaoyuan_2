@@ -20,7 +20,7 @@
  *   关节 1~4 = 电机 CAN ID 1~4；关节端总减速比 101/162/162/101；
  *   J2/J3 含 1:2 锥齿轮（kMotorRadPerJointRad = 1/2/2/1）；
  *   软限位（关节端，度）：J1 ±120、J2 ±120（电机端 ±240）、
- *                          J3 −30~+180（电机端 −60~+360）、J4 ±90。
+ *                          J3 −60~+180（电机端 −120~+360）、J4 ±90。
  *   方向符号（kJointDirSign）与 taihu_singleleg_step_xCAN 一致：正角 = 逆时针（ccw）。
  *
  * 安全保护：
@@ -69,9 +69,9 @@ namespace
     /// 该 demo 关键帧 {0,180,180,0} 中 ID2/ID3 同为 +180°，P 型锥齿轮电机端同向。
     const double kJointDirSign[kJointCount] = {1.0, 1.0, 1.0, 1.0};
     /// 软件限位（关节端度）；电机端等效 = ×kMotorRadPerJointRad：
-    ///   J1 ±120°；J2 ±120° ↔ ±240°；J3 −30°~+180° ↔ −60°~+360°；J4 ±90°。
+    ///   J1 ±120°；J2 ±120° ↔ ±240°；J3 −60°~+180° ↔ −120°~+360°；J4 ±90°。
     const double kJointLimitDeg[kJointCount][2] = {
-        {-120.0, 120.0}, {-120.0, 120.0}, {-30.0, 180.0}, {-90.0, 90.0}};
+        {-120.0, 120.0}, {-120.0, 120.0}, {-60.0, 180.0}, {-90.0, 90.0}};
 
     // —— 控制参数 ——
     constexpr int32_t kPositionKp = 4000;     ///< 电机位置环 KP（0x2B）
@@ -454,7 +454,7 @@ int main(int argc, char **argv)
     std::printf("=== 单腿 4 关节 纯 PD 位置模式 demo（200Hz）===\n");
     std::printf("接口 %s | 电机 ID 1~4 | 关节端减速比 101/162/162/101 | KP=%d KD=%d\n",
                 ifname.c_str(), kPositionKp, kPositionKd);
-    std::printf("限位(°): J1 ±120 | J2 ±120 | J3 −30~+180 | J4 ±90\n");
+    std::printf("限位(°): J1 ±120 | J2 ±120 | J3 −60~+180 | J4 ±90\n");
     std::printf("提示: 通道需先手动开启: sudo ./build/kcanctl up %s 1000000\n\n",
                 ifname.c_str());
 

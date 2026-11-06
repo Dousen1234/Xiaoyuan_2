@@ -1,0 +1,69 @@
+# =====================================================================
+# 鲲弘 KCAN-USB FD 六路适配器 —— 按 USB 物理端口固定命名
+# =====================================================================
+#
+# 【为什么需要这个文件】
+#
+# kcan 驱动注册 netdevice 时用的是"抢空位"式命名：内核给它什么名字就用
+# 什么名字，不由物理端口决定。RK3588 板载 CAN（fea60000.can）比 USB 适配器
+# 先枚举，先占走 can0；随后 10-can-mcu.link 又把板载 CAN 改名成 can_mcu，
+# 把 can0 这个编号空了出来。结果就是：
+#
+#   USB 第 1~4 个口  → can1 / can2 / can3 / can4
+#   USB 第 5 个口    → can0   （捡走了板载 CAN 腾出来的编号）
+#   USB 第 6 个口    → can5
+#
+# 即 can0 并不对应第 1 个物理口，而是第 5 个。更严重的是这属于竞态：
+# 一旦开机时序或 USB 插拔顺序变化，can0 可能落到别的口上，导致上层控制
+# 程序"勾选了 can0、实际驱动的却是另一个物理通道"。
+#
+# 【本文件的作用】
+#
+# 用 systemd .link 文件按 ID_PATH（USB 物理拓扑路径）匹配设备，强制指定
+# 接口名，使映射在每次开机、每次插拔后都保持不变：
+#
+#   platform-fc880000.usb-usb-0:1.4.2.1:1.0 → can0
+#   platform-fc880000.usb-usb-0:1.4.2.2:1.0 → can1
+#   platform-fc880000.usb-usb-0:1.4.2.3:1.0 → can2
+#   platform-fc880000.usb-usb-0:1.4.2.4:1.0 → can3
+#   platform-fc880000.usb-usb-0:1.4.2.5:1.0 → can4
+#   platform-fc880000.usb-usb-0:1.4.2.6:1.0 → can5
+#
+# 注意：.link 文件只能写一个 [Match] + 一个 [Link] 组合，因此六个口需要
+# 六个独立的 .link 文件。本包已一并提供：
+#
+#   60-kcan-persistent-name-0.link   (2.1 → can0)
+#   60-kcan-persistent-name-1.link   (2.2 → can1)
+#   60-kcan-persistent-name-2.link   (2.3 → can2)
+#   60-kcan-persistent-name-3.link   (2.4 → can3)
+#   60-kcan-persistent-name-4.link   (2.5 → can4)
+#   60-kcan-persistent-name-5.link   (2.6 → can5)
+#
+# 本说明文件不参与匹配，仅作文档，安装脚本会自动跳过它。
+#
+# 【安装方法】
+#
+#   sudo ./install_kcan_persistent_name.sh
+#
+# 安装后需重新触发或重启使命名生效（脚本会提示）。
+#
+# 【生效后如何核查】
+#
+#   # 查看每个接口对应的 USB 物理路径
+#   for n in can0 can1 can2 can3 can4 can5; do
+#       printf '%-6s %s\n' "$n" \
+#           "$(udevadm info -q property -p /sys/class/net/$n | grep '^ID_PATH=')"
+#   done
+#
+# 期望结果：can0↔…2.1、can1↔…2.2、can2↔…2.3、can3↔…2.4、
+#           can4↔…2.5、can5↔…2.6
+#
+# 【注意事项】
+#
+# 1. ID_PATH 中的 "fc880000.usb" 是 RK3588 这一路 USB 控制器的地址，
+#    换到别的板子上要按实际值修改（用 udevadm info 现查）。
+# 2. 该 USB 控制器下如果还有别的、非 KCAN 的网络设备占用同样的拓扑，
+#    需要补充 Driver=kcan 之类的匹配条件以防误改。
+# 3. 若日后把适配器插到另一个 USB 口（比如从 2-1.4.2 换到 2-1.4.3），
+#    这些规则就会全部失配，必须同步更新 ID_PATH。
+# =====================================================================

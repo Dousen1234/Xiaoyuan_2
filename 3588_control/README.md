@@ -221,6 +221,39 @@ sudo ip link add dev vcan0 type vcan
 
 ## 3. 怎么打开鲲弘的 can0~can3（电机总线）
 
+> ### ⚠️ 先读这一条：`can0` **不是**第 1 个 USB 口
+>
+> kcan 驱动按**枚举顺序"抢空位"**命名，不是按 USB 口编号命名。
+>
+> `dmesg` 实测的枚举过程（每次开机都会走一遍）：
+>
+> ```
+> [5.535] kcan 2-1.4.2.1 → can1
+> [5.542] kcan 2-1.4.2.2 → can2
+> [5.546] kcan 2-1.4.2.3 → can3
+> [5.549] kcan 2-1.4.2.4 → can4
+> [5.570] rockchip_canfd fea60000.can → renamed from can0   ← 板载先占 can0，随后被 .link 改名让位
+> [5.652] kcan 2-1.4.2.5 → can0                             ← 第 5 个 USB 口抢到刚空出来的 can0
+> [5.831] kcan 2-1.4.2.6 → can5
+> ```
+>
+> 所以默认状态下：
+>
+> | 接口名 | 实际物理口 |
+> |---|---|
+> | **`can0`** | **USB `2-1.4.2.5`（第 5 口）** |
+> | `can1` | USB `2-1.4.2.1`（第 1 口） |
+> | `can2` | USB `2-1.4.2.2` |
+> | `can3` | USB `2-1.4.2.3` |
+> | `can4` | USB `2-1.4.2.4` |
+> | `can5` | USB `2-1.4.2.6`（第 6 口） |
+> | `can_mcu` | 板载 `fea60000.can` |
+>
+> 而且这个映射**每次重启/插拔都可能变**。想固定下来见 §3.6。
+>
+> UI 的【① CAN 接口配置】里有一列【物理端口】，直接把上表最后一列显示出来，
+> 不用再猜。
+
 ### 3.1 确认设备已识别
 
 ```bash
@@ -291,6 +324,62 @@ sudo ~/walk_systemctl/workspaces/Xiaoyuan_2/build/taihu_motor_tools --if can0 --
 
 # 或者用 lower_control 的探测功能（启动时会自动打印在线性）
 ```
+
+### 3.6 固定通道命名（推荐做一次，永久生效）
+
+因为 §3 开头那条陷阱，建议花 1 分钟把 `can0↔第1口 … can5↔第6口` 固定下来。
+
+**先自检**（不需要 root，随时可跑）：
+
+```bash
+cd ~/walk_systemctl/workspaces/Xiaoyuan_2/3588_control/deploy
+./install_kcan_persistent_name.sh --check
+```
+
+会打印当前的「接口 ↔ 物理口」对照表，并逐行给出 `[ OK ]` / `[FAIL]`。未固定时典型输出：
+
+```
+[FAIL] can0 实际对应物理口 2-1.4.2.5，期望 2-1.4.2.1
+[FAIL] can1 实际对应物理口 2-1.4.2.1，期望 2-1.4.2.2
+...
+[ OK ] can5 ↔ 物理口 2-1.4.2.6
+[ OK ] can_mcu 在位（板载 CAN）
+```
+
+**安装**（需要 root，会写 `/etc/systemd/network/`）：
+
+```bash
+sudo ./install_kcan_persistent_name.sh
+```
+
+脚本做的事：
+
+1. 把旧规则备份到 `/root/kcan-persistent-name.bak.<时间戳>`
+2. 写 6 个 `.link` 文件 `60-kcan-persistent-name-0.link` ~ `-5.link`，
+   用 USB 路径（如 `platform-fc880000.usb-usb-0:1.4.2.1:1.0`）匹配，固定 `Name=canN`
+3. `udevadm trigger --action=add --subsystem-match=net` + `udevadm settle`
+4. 若仍在错位，自动 `down` 所有通道 → `modprobe -r kcan` → `modprobe kcan` → 再 settle
+5. 打印新映射表并做校验
+
+**安装后再检查**（不需要 root）：
+
+```bash
+./install_kcan_persistent_name.sh --check
+```
+
+全部 `[ OK ]` 即成功。
+
+**注意事项**：
+
+| 项 | 说明 |
+|---|---|
+| 波特率 / up 状态会丢 | 重新枚举后所有通道回到 DOWN，需要在 UI 里重新勾选 + 点【应用配置】 |
+| 规则是针对本机的 | `platform-fc880000.usb` 是 RK3588 的 USB 控制器名，换板子要改 `USB_CTRL_PATH` |
+| 换 USB 插口会失效 | 规则按物理路径匹配，把适配器插到别的口，那条规则就不再匹配它 |
+| 卸载 | `sudo ./install_kcan_persistent_name.sh --uninstall`（之后命名重新变得不确定） |
+
+文件都在 `3588_control/deploy/`，其中 `60-kcan-persistent-name.link`（无编号那个）
+是**纯说明文档**，不含 `[Match]`，不会被 udev 生效，可以放心留着。
 
 ---
 
@@ -559,7 +648,7 @@ cd ~/walk_systemctl/workspaces/Xiaoyuan_2/3588_control/build
 ```
 J1: [-120, +120]      ← 已从 ±90° 放宽到 ±120°
 J2: [-120, +120]
-J3: [-30,  +180]      ← 注意不对称
+J3: [-60,  +180]      ← 注意不对称；下限已从 −30° 放宽到 −60°
 J4: [-90,  +90]
 ```
 
@@ -757,7 +846,7 @@ $$s'(u)=30u^2(1-u)^2 \;\ge\; 0 \quad (0\le u\le 1)$$
 ```
 J1: [-120, +120]
 J2: [-120, +120]
-J3: [-30,  +180]      ← 注意不对称
+J3: [-60,  +180]      ← 注意不对称；下限已从 −30° 放宽到 −60°
 J4: [-90,  +90]
 ```
 
@@ -958,7 +1047,11 @@ sudo ./run_ui_sudo.sh
 | ⑤ 电机状态反馈 | 16 关节 × 7 列（在线 / 实际角 / 帧数 / 限位） | 原本只能看日志 |
 | ⑥ CAN 总线状态 | UP/DOWN、波特率、错误计数，1.5 s 刷新 | `ip -details link show` |
 | ⑦ 运行日志 | 4 个标签页：系统 / 下位机 / 上位机 / 回零 | 各终端滚屏 |
-| 顶栏 | 急停、清限位、心跳、软限位 | `estop` + CAN 广播 0x02 |
+| 顶栏 | 急停、清限位、心跳、软限位 | `estop` / `clear` + CAN 广播 0x02 / 0x03 |
+
+> **【清限位】按钮**：仅在下位机报软限位锁定时变为可点（橙底红边），
+> 无报警或未打开 CAN 监控时置灰。点击等价于向下位机写 `clear` **并且**
+> 在 `can5` 广播 `0x03`。清除后触限关节仍需退回限位内 ≥2.0° 才能重新接收目标角。
 
 **默认波特率**：`can0~can3` = `1000000`，`can5` / `can_mcu` = `990000`（可改）。
 `can5` 与 `can_mcu` **必须一致**，否则上下位机链路直接 ERROR-PASSIVE。
