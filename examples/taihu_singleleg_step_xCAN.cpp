@@ -85,7 +85,7 @@ namespace
     ///   因此实际阶段时长 = max(kPhaseSec, 到位所需时间)，把它调小（如 1.0）即可加快
     ///   步态，且绝不会出现「轨迹没走完就切下一阶段」。
     /// 修改后绘图时须给 tools/plot_motor_log.py 传 --phase-sec 保持一致（步数 N 用 --num-steps）。
-    constexpr double kPhaseSec = 4.0;
+    constexpr double kPhaseSec = 10.0;
 
     /// 一步包含的阶段数（阶段 0 零位保持 / 阶段 1 正摆 / 阶段 2 回摆）。
     constexpr int kPhasesPerStep = 3;
