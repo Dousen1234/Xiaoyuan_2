@@ -1,0 +1,16 @@
+# 编译产物（build.sh / CMake 生成的可执行文件，都是 Linux ELF）
+test_rotate
+test_positionctrl
+selftest_sim
+selftest_position
+
+# CMake / 手动编译的中间产物
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.d
+*.a
+*.so

@@ -1,0 +1,39 @@
+# 手爪资料的重复副本（与 资料/ 内容相同，约 93 MB）
+资料 copy/
+
+# Python 虚拟环境与缓存
+.venv/
+__pycache__/
+*.pyc
+
+# 调试产物：抓包日志、参数快照、临时文件
+logs/
+*.jsonl
+*.pcap
+*.pcapng
+
+# Keil/固件编译中间产物
+*.hex
+*.bin
+*.axf
+*.map
+*.o
+*.d
+*.crf
+*.lst
+MDK-ARM/Objects/
+MDK-ARM/Listings/
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+
+# ★ 例外：固件备份镜像要入库
+#   这些是板上固件的原始烧录镜像，用于刷坏后回滚。
+#   总共约 237 KB，新设备 clone 下来即可直接刷写，不必另找镜像。
+#   刷写方法见 testcmd_ssj1110/firmware_backup/2026-11-12/README.md
+!testcmd_ssj1110/firmware_backup/**
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
